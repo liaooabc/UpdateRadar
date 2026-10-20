@@ -68,6 +68,13 @@ else
     sed -n '1,3p' /tmp/radar-push.log | sed 's/^/    /'
 fi
 
+# ── 1.5 先确认安装包在不在（别先建了空的 Release 再发现没包） ──
+if [ ! -f "${DMG}" ]; then
+    say "找不到 ${DMG}"
+    say "先双击「发版.command」打一个包，再回来发布。"
+    echo; read -n 1 -s -r -p "按任意键关闭"; exit 1
+fi
+
 # ── 2. 建 Release ────────────────────────────────────────
 say "▸ 2/3 创建 Release ${TAG}"
 BODY=$(cat <<TXT
@@ -115,10 +122,6 @@ fi
 
 # ── 3. 传安装包 ──────────────────────────────────────────
 say "▸ 3/3 上传安装包"
-if [ ! -f "${DMG}" ]; then
-    say "  找不到 ${DMG}，先双击「发版.command」打一个包再来。"
-    echo; read -n 1 -s -r -p "按任意键关闭"; exit 1
-fi
 ASSET="UpdateRadar-${VER}-arm64.dmg"
 curl -sS -X POST "${UP}?name=${ASSET}" \
     -H "Authorization: Bearer ${TOKEN}" \
