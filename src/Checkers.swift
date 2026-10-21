@@ -151,11 +151,48 @@ func parseISO8601(_ s: String?) -> Date? {
 
 // MARK: - 网络
 
+/// 从更新源地址推「官网」：
+/// - GitHub 托管的（raw.githubusercontent.com / github.com/owner/repo/...）→ 仓库页
+/// - downloads./download./cdn. 开头的下载主机场 → 去掉那一段（downloads.skylum.com → skylum.com）
+/// - 其余取站点根（mole.fit/appcast.xml → mole.fit）
+func siteFromFeed(_ urlString: String?) -> String? {
+    guard let s = urlString, let u = URL(string: s), let host = u.host?.lowercased() else { return nil }
+    let parts = u.path.split(separator: "/").map(String.init)
+    if host == "github.com" || host == "raw.githubusercontent.com" {
+        if parts.count >= 2 { return "https://github.com/\(parts[0])/\(parts[1])" }
+        return "https://github.com"
+    }
+    var bare = host
+    for p in ["downloads.", "download.", "cdn.", "dl."] where bare.hasPrefix(p) {
+        bare = String(bare.dropFirst(p.count))
+        break
+    }
+    // 产品子域也收成主域：luminarneomac.skylum.com → skylum.com。
+    // 但 github.io / netlify.app 这类托管后缀的主域没意义，别动。
+    let labels = bare.split(separator: ".").map(String.init)
+    let hosting = ["github.io", "netlify.app", "vercel.app", "pages.dev",
+                   "gitlab.io", "fly.dev", "web.app", "firebaseapp.com"]
+    if labels.count >= 3, !bare.hasPrefix("www.") {
+        let base = labels.suffix(2).joined(separator: ".")
+        if !hosting.contains(base) { bare = base }
+    }
+    // GitHub Pages 这类托管站，真正的站名在路径第一段：farzaa.github.io/clicky-releases
+    if labels.count >= 3, hosting.contains(labels.suffix(2).joined(separator: ".")),
+       let first = parts.first, !first.isEmpty {
+        return "https://\(bare)/\(first)"
+    }
+    return "https://\(bare)"
+}
+
 enum Net {
     static let session: URLSession = {
         let c = URLSessionConfiguration.ephemeral
-        c.timeoutIntervalForRequest = 15
-        c.timeoutIntervalForResource = 25
+        // 死掉的源（停更的 appcast、国内连不上的接口）会一直占着并发槽位，
+        // 所以超时不能给太宽裕：10 秒还没回话就当它没有。
+        c.timeoutIntervalForRequest = 8
+        c.timeoutIntervalForResource = 12
+        // 默认每主机只 6 条连接，iTunes 查询动辄 30 个包，会被自己卡住
+        c.httpMaximumConnectionsPerHost = 12
         c.httpAdditionalHeaders = [
             "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
         ]
@@ -184,27 +221,186 @@ enum Net {
         }
     }
 
-    static func text(_ urlString: String, retry: Bool = true) async -> String? {
+    /// 注意：这里**故意不做失败重试**。以前失败会 sleep 0.5 秒再试一次，
+    /// 等于把一个死掉的更新源（停更的 appcast、国内连不上的接口）的成本从 8 秒翻到 16 秒，
+    /// 而并发槽位被它占着，整轮检查就被一两个死源拖到十几秒。
+    /// 现在只保留 raw.githubusercontent.com → jsDelivr 的镜像兜底（那是「换条路能通」，
+    /// 不是「同一条路再撞一次」）。
+    static func text(_ urlString: String) async -> String? {
         if let s = await fetchText(urlString) { return s }
-        guard retry else { return nil }
         if let alt = jsdelivrMirror(urlString), let s = await fetchText(alt) { return s }
-        try? await Task.sleep(nanoseconds: 500_000_000)
-        return await fetchText(urlString)
+        return nil
     }
 
-    static func json(_ urlString: String, retry: Bool = true) async -> Any? {
+    static func json(_ urlString: String) async -> Any? {
         guard let url = URL(string: urlString) else { return nil }
         do {
             let (data, resp) = try await session.data(from: url)
             guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
             return try? JSONSerialization.jsonObject(with: data)
         } catch {
-            if retry {
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                return await json(urlString, retry: false)
-            }
             return nil
         }
+    }
+}
+
+// MARK: - Homebrew Cask
+
+/// Homebrew Cask 是社区维护的 Mac 软件版本库（7000+ 个 App，含大量没有 appcast 的商业软件）。
+/// 设计取舍：18MB 的完整索引不下载 —— 随 App 带一张 120KB 的「App 名 → cask 名」表，
+/// 运行时只按需拉单个 cask 的 1KB JSON，结果缓存 12 小时。这样内存和流量都可控。
+enum Cask {
+    struct Entry {
+        let token: String
+        let version: String
+        let homepage: String?
+    }
+
+    private static let lock = NSLock()
+    private static var store: [String: Cached]?
+    private static var mapLoaded = false
+    private static var nameMap: [String: String] = [:]
+    private static var bundleMap: [String: String] = [:]
+
+    private struct Cached: Codable {
+        var version: String
+        var homepage: String?
+        var fetchedAt: Date
+        var bundles: [String]?     // cask 里登记的 bundle id，用来复核同名不同版
+    }
+
+    private static var cacheURL: URL { UpdateService.supportDir.appendingPathComponent("cask-cache.json") }
+
+    /// 名称表随包发布：{"apps": {"sketch.app": "sketch"}, "bundles": {"com.microsoft.Word": "microsoft-word"}}
+    private static func loadMap() {
+        guard !mapLoaded else { return }
+        mapLoaded = true
+        guard let url = Bundle.main.url(forResource: "cask-map", withExtension: "json"),
+              let data = try? Data(contentsOf: url),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        nameMap = obj["apps"] as? [String: String] ?? [:]
+        bundleMap = obj["bundles"] as? [String: String] ?? [:]
+    }
+
+    /// 一个 App 对应哪个 cask：先按 .app 文件名，再按 bundle id
+    static func token(for app: InstalledApp) -> (token: String, exact: Bool)? {
+        loadMap()
+        // bundle id 最可靠（能排除同名不同 App），其次才按 .app 文件名
+        if let bid = app.bundleId, let t = bundleMap[bid] { return (t, true) }
+        let file = (app.path as NSString).lastPathComponent.lowercased()
+        if let t = nameMap[file] { return (t, false) }
+        return nil
+    }
+
+    /// cask 的 uninstall 段里写着「卸载时要退出的 bundle id」（如 notion.id），
+    /// 拿它反查这到底是哪个 App。只看 uninstall：zap/trash 里混着路径，会误判。
+    private static func bundleIds(in obj: [String: Any]) -> Set<String> {
+        var ids: Set<String> = []
+        func walk(_ o: Any) {
+            if let d = o as? [String: Any] { d.values.forEach(walk) }
+            else if let a = o as? [Any] { a.forEach(walk) }
+            else if let str = o as? String {
+                for part in str.split(whereSeparator: { " ,;".contains($0) }) {
+                    let t = String(part)
+                    let dots = t.filter { $0 == "." }.count
+                    let clean = t.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
+                    if dots >= 2, clean, !t.hasSuffix(".plist"), !t.hasSuffix(".app") {
+                        ids.insert(t)
+                    }
+                }
+            }
+        }
+        for a in obj["artifacts"] as? [Any] ?? [] {
+            if let d = a as? [String: Any], let u = d["uninstall"] { walk(u) }
+        }
+        return ids
+    }
+
+    private static func loadCache() -> [String: Cached] {
+        lock.lock(); defer { lock.unlock() }
+        if let store { return store }
+        var loaded: [String: Cached] = [:]
+        if let data = try? Data(contentsOf: cacheURL),
+           let decoded = try? JSONDecoder().decode([String: Cached].self, from: data) {
+            loaded = decoded
+        }
+        store = loaded
+        return loaded
+    }
+
+    private static func saveCache(_ entry: Cached, token: String) {
+        lock.lock(); defer { lock.unlock() }
+        var current = store ?? [:]
+        current[token] = entry
+        // 只留最近 300 条，别让缓存文件无限长
+        if current.count > 300 {
+            let newest = current.sorted { $0.value.fetchedAt > $1.value.fetchedAt }.prefix(300)
+            current = Dictionary(uniqueKeysWithValues: newest.map { ($0.key, $0.value) })
+        }
+        store = current
+        if let data = try? JSONEncoder().encode(current) {
+            try? data.write(to: cacheURL)
+        }
+    }
+
+    /// 1.2.3,456 → 1.2.3；3.6.7-dbc92f97 → 3.6.7；2026.3.1 原样
+    private static func cleanVersion(_ raw: String) -> String? {
+        var v = raw.split(separator: ",").first.map(String.init) ?? raw
+        v = v.trimmingCharacters(in: .whitespaces)
+        if let dash = v.firstIndex(of: "-"), v[..<dash].contains(where: { $0.isNumber }) {
+            v = String(v[..<dash])
+        }
+        guard let first = v.first, first.isNumber else { return nil }
+        return v
+    }
+
+    private static func fetch(_ token: String) async -> Cached? {
+        if let hit = loadCache()[token], Date().timeIntervalSince(hit.fetchedAt) < 12 * 3600 {
+            return hit
+        }
+        guard let obj = await Net.json("https://formulae.brew.sh/api/cask/\(token).json") as? [String: Any],
+              let raw = obj["version"] as? String,
+              let version = cleanVersion(raw) else { return nil }
+        let entry = Cached(version: version,
+                           homepage: obj["homepage"] as? String,
+                           fetchedAt: Date(),
+                           bundles: Array(bundleIds(in: obj)))
+        saveCache(entry, token: token)
+        return entry
+    }
+
+    static func lookup(_ app: InstalledApp) async -> Entry? {
+        guard let hit = token(for: app), let c = await fetch(hit.token) else { return nil }
+        // 只按文件名对上的，再用 cask 登记的 bundle id 复核一次：
+        // 本机装的是 Telegram Desktop（com.tdesktop.Telegram），cask 里是原生版（ru.keepcoder.Telegram），名字一样但不是同一个 App
+        if !hit.exact, let ids = c.bundles, !ids.isEmpty, let bid = app.bundleId, !ids.contains(bid) {
+            return nil
+        }
+        return Entry(token: hit.token, version: c.version, homepage: c.homepage)
+    }
+
+    /// 变成检测结果；本机比库里还新时给一句解释（内测版/官网还没同步）
+    /// 16.114 对 16.114.26101123：多出来的那段是构建号，不是新版本
+    static func isBuildOnlyBump(_ latest: String, over current: String) -> Bool {
+        let l = latest.split(separator: ".").map(String.init)
+        let c = current.split(separator: ".").map(String.init)
+        guard l.count > c.count, Array(l.prefix(c.count)) == c else { return false }
+        return l.dropFirst(c.count).allSatisfy { $0.count >= 6 && $0.allSatisfy(\.isNumber) }
+    }
+
+    static func verdict(_ app: InstalledApp, entry: Entry) -> Checker.Outcome {
+        if isBuildOnlyBump(entry.version, over: app.version) {
+            return Checker.Outcome(status: .upToDate, latest: entry.version, url: entry.homepage, note: nil)
+        }
+        let newer = Ver.isNewer(entry.version, than: app.version)
+        let note: String? = (!newer && Ver.isNewer(app.version, than: entry.version))
+            ? "社区版本库记录的是 \(entry.version)，你装的更新（可能是内测版）"
+            : nil
+        return Checker.Outcome(status: newer ? .updateAvailable : .upToDate,
+                               latest: entry.version,
+                               url: entry.homepage ?? "https://formulae.brew.sh/cask/\(entry.token)",
+                               homepage: entry.homepage,
+                               note: note)
     }
 }
 
@@ -224,7 +420,8 @@ enum Checker {
         if let rule = Rules.match(app) {
             if let r = await rule.run(app) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
-                                   downloadURL: r.url, note: r.note, source: "vendor",
+                                   downloadURL: r.url, homepage: r.homepage ?? r.url, note: r.note,
+                                   source: "vendor",
                                    checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
             }
             // 规则命中但这次没抓到：说明是网络/页面变动问题，不是“没有检测源”
@@ -235,8 +432,14 @@ enum Checker {
         if let feed = app.sparkleFeed {
             if let r = await sparkle(feed: feed, current: app.version) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
-                                   downloadURL: r.url, note: nil, source: "sparkle",
+                                   downloadURL: r.url,
+                                   homepage: r.homepage ?? siteFromFeed(feed),
+                                   note: nil, source: "sparkle",
                                    checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
+            }
+            // appcast 这次没抓到：先用社区版本库兜一层，别急着报「检测失败」
+            if let entry = await Cask.lookup(app) {
+                return result(app, Cask.verdict(app, entry: entry), source: "cask", now: now)
             }
             return failed("更新源没有响应")
         }
@@ -245,19 +448,33 @@ enum Checker {
         if let bidReal = app.bundleId, app.isAppStore {
             if let r = await appStore(bundleId: bidReal, current: app.version, installedAt: app.installedAt) {
                 return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
-                                   downloadURL: r.url, note: nil, source: "appstore",
+                                   downloadURL: r.url, homepage: r.homepage, note: nil, source: "appstore",
                                    checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
             }
+        }
+
+        // 4. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
+        if let entry = await Cask.lookup(app) {
+            return result(app, Cask.verdict(app, entry: entry), source: "cask", now: now)
         }
 
         return CheckResult(bundleId: bid, status: .unknown, latest: nil,
                            downloadURL: nil, note: nil, source: "manual", checkedAt: now)
     }
 
+    /// Outcome → CheckResult（cask 这条路用，带来源标记）
+    static func result(_ app: InstalledApp, _ o: Outcome, source: String, now: Date) -> CheckResult {
+        CheckResult(bundleId: app.id, status: o.status, latest: o.latest,
+                    downloadURL: o.url, homepage: o.homepage ?? o.url, note: o.note, source: source,
+                    checkedAt: now, releaseDate: o.releaseDate, notes: o.notes)
+    }
+
+
     struct Outcome {
         var status: CheckStatus
         var latest: String?
         var url: String?
+        var homepage: String? = nil
         var note: String?
         var releaseDate: Date?
         var notes: String?
@@ -279,6 +496,7 @@ enum Checker {
             return Outcome(status: newer ? .updateAvailable : .upToDate,
                            latest: latest,
                            url: it.enclosure ?? it.link ?? feed,
+                           homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
                            note: nil,
                            releaseDate: parseRFC822(it.pubDate),
                            notes: newer ? notes : nil)
@@ -294,6 +512,9 @@ enum Checker {
               let first = results.first,
               let latest = first["version"] as? String else { return nil }
         let page = first["trackViewUrl"] as? String
+        // sellerUrl 是开发者自己的官网（Compressor → apple.com/mac/compressor …），
+        // 比商店产品页更像「软件网站」
+        let seller = (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString }
         let release = parseISO8601(first["currentVersionReleaseDate"] as? String)
 
         // 有些开发者发版时没同步 Mac 包里的 CFBundleShortVersionString，
@@ -301,14 +522,14 @@ enum Checker {
         // 这里用安装时间兜底：包比商店那次发布还新，就说明拿到的就是最新包。
         if Ver.isNewer(latest, than: current), let installedAt, let release,
            installedAt > release.addingTimeInterval(60 * 60) {
-            return Outcome(status: .upToDate, latest: latest, url: page,
+            return Outcome(status: .upToDate, latest: latest, url: page, homepage: seller,
                            note: "商店版本是 \(latest)，但本机包内标注 \(current)：开发者没同步 Mac 包的版本号，App Store 也认为已是最新",
                            releaseDate: release)
         }
 
         let isNewer = Ver.isNewer(latest, than: current)
         return Outcome(status: isNewer ? .updateAvailable : .upToDate,
-                       latest: latest, url: page, note: nil,
+                       latest: latest, url: page, homepage: seller, note: nil,
                        releaseDate: release,
                        notes: isNewer ? plainNotes(first["releaseNotes"] as? String) : nil)
     }
@@ -330,7 +551,8 @@ enum Rules {
             ? "官方源当前是 \(latest)，你装的版本更高（可能是内测版）"
             : nil
         return Checker.Outcome(status: newer ? .updateAvailable : .upToDate,
-                               latest: latest, url: url, note: note, releaseDate: releaseDate)
+                               latest: latest, url: url, homepage: url,
+                               note: note, releaseDate: releaseDate)
     }
 
     /// 官网页面里抓版本号
@@ -401,6 +623,16 @@ enum Rules {
         VendorRule(matches: { $0.bundleId == "net.ankiweb.anki" }) { app in
             await githubRepo(app: app, repo: "ankitects/anki",
                              downloadPage: "https://apps.ankiweb.net/")
+        },
+        // 洛雪音乐
+        VendorRule(matches: { $0.bundleId == "cn.toside.music.desktop" }) { app in
+            await githubRepo(app: app, repo: "lyswhut/lx-music-desktop",
+                             downloadPage: "https://github.com/lyswhut/lx-music-desktop/releases")
+        },
+        // UVR（Ultimate Vocal Remover）
+        VendorRule(matches: { $0.id == "UVR" || $0.bundleId == "UVR" }) { app in
+            await githubRepo(app: app, repo: "Anjok07/ultimatevocalremovergui",
+                             downloadPage: "https://github.com/Anjok07/ultimatevocalremovergui/releases")
         }
     ]
 

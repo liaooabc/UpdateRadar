@@ -61,6 +61,10 @@ else
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
 fi
 
+echo "▸ 资源（Homebrew Cask 名称表）"
+mkdir -p "$APP/Contents/Resources"
+cp "$ROOT/Resources/cask-map.json" "$APP/Contents/Resources/cask-map.json"
+
 echo "▸ Info.plist"
 cp "$ROOT/Info.plist" "$APP/Contents/Info.plist"
 printf 'APPL????' > "$APP/Contents/PkgInfo"

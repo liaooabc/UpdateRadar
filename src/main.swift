@@ -200,30 +200,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         freqItem.submenu = freqMenu
         menu.addItem(freqItem)
 
-        let hideUnknown = NSMenuItem(title: "只显示有检测源的 App", action: #selector(toggleHideUnknown), keyEquivalent: "")
-        hideUnknown.target = self
-        hideUnknown.state = service.settings.hideUnknown ? .on : .off
-        menu.addItem(hideUnknown)
-
-        let notify = NSMenuItem(title: "有新版本时通知我", action: #selector(toggleNotify), keyEquivalent: "")
-        notify.target = self
-        notify.state = service.settings.notifyEnabled ? .on : .off
-        menu.addItem(notify)
-
+        // 顺序按用户定稿：检查频率 → 菜单栏显示数量 → 有新版本时通知我
         let showCount = NSMenuItem(title: "菜单栏显示数量", action: #selector(toggleShowCount), keyEquivalent: "")
         showCount.target = self
         showCount.state = service.settings.countVisible ? .on : .off
         menu.addItem(showCount)
 
-        menu.addItem(.separator())
-
-        let dataItem = NSMenuItem(title: "打开数据文件夹", action: #selector(openDataFolder), keyEquivalent: "")
-        dataItem.target = self
-        menu.addItem(dataItem)
-
-        let notifItem = NSMenuItem(title: "打开系统通知设置", action: #selector(openNotificationSettings), keyEquivalent: "")
-        notifItem.target = self
-        menu.addItem(notifItem)
+        let notify = NSMenuItem(title: "有新版本时通知我", action: #selector(toggleNotify), keyEquivalent: "")
+        notify.target = self
+        notify.state = service.settings.notifyEnabled ? .on : .off
+        menu.addItem(notify)
 
         menu.addItem(.separator())
 
@@ -265,7 +251,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func checkNow() {
         service.rescan()
-        service.checkAll()
+        service.checkAll(force: true)
     }
 
     @objc private func quitApp() { NSApp.terminate(nil) }

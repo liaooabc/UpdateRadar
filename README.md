@@ -53,17 +53,33 @@
 - 点横幅会直接展开菜单栏面板。
 - 齿轮菜单里可以关掉通知，或跳到系统通知设置。首次运行系统会问一次是否允许。
 
-## 检测原理（三层，逐层回退）
+## 检测原理（四层，逐层回退）
 
 1. **厂商专用规则**：没有标准更新源的 App，直接读官网页面 / GitHub 上的版本号。目前覆盖：
    - 微信：从官网下载链接 `WeChatMac_4.1.15.dmg` 取版本
    - QQ：官网 dmg 文件名里的稳定版版本号（内测版另算）
-   - Obsidian / Motrix / Anki：GitHub Releases 最新 tag
+   - Obsidian / Motrix / Anki / 洛雪音乐 / UVR：GitHub Releases 最新 tag
    - Chrome：`versionhistory.googleapis.com` 国内不通，改用 Chrome for Testing 的 Stable 版本
    - WPS Office：官网产品页里的版本号
 2. **Sparkle appcast**：App 的 `Info.plist` 里有 `SUFeedURL` 就能读它的更新源（本机 34 个 App 有）。
    注意区分营销版本号（`<title>` / `sparkle:shortVersionString`）和内部构建号（`sparkle:version`）——构建号不能拿来和版本号比。
+   抓失败时先交给第 4 层兜一次，别急着把行标成「检测失败」。
 3. **Mac App Store**：带 `_MASReceipt` 的 App 用 `itunes.apple.com/lookup?bundleId=` 查商店版本。
+4. **Homebrew Cask**（社区维护的版本库，7000+ 个 Mac App，含大量没有 appcast 的商业软件）：
+   覆盖 Sketch、Spotify、Telegram、Raycast、Notion、Blender、Zotero、GitHub Desktop、
+   Microsoft Office 五件套、Topaz 三件套、Canva、哔哩哔哩、DropDMG、UPDF 等。
+
+   实现上不下载那份 18 MB 的完整索引：`Resources/cask-map.json`（约 0.7 MB）随 App 发布，
+   里面是「.app 文件名 / bundle id → cask 名」的映射；运行时只按需拉单个 cask 的约 1 KB JSON，
+   结果按 12 小时缓存到 `~/Library/Application Support/UpdateRadar/cask-cache.json`。
+   映射表用 `python3 tools/make_cask_map.py` 重新生成（想覆盖更多 App 时隔一两个月跑一次）。
+
+   cask 这条路有两个坑，代码里都堵上了：
+   - **同名不同版**：Telegram.app 可能是 `com.tdesktop.Telegram`（Telegram Desktop）也可能是
+     `ru.keepcoder.Telegram`（原生版），版本号体系完全不同。所以「只按文件名对上的」匹配，
+     还要用 cask 的 `uninstall` 段里登记的 bundle id 复核，对不上就判为另一个 App。
+   - **构建号不是版本号**：Office 的 cask 版本写作 `16.114.26101123`，本机标注 `16.114`，
+     直接比会天天报「有新版本」。所以「多出来的几段都是 6 位以上纯数字」时按已最新处理。
 
 都没有的 App 记为「无检测源」，仍然列出来但不会打扰你。
 
@@ -77,7 +93,7 @@
 | 单次检查进行中 | 峰值 ~77 MB，结束后回落 | 短暂 10% 左右 |
 | 面板打开 | ~50 MB | 0.0% |
 
-磁盘：App 本身 2.6 MB（其中 1.9 MB 是图标资源），数据文件 28 KB。
+磁盘：App 本身 3.4 MB（1.9 MB 图标资源 + 0.7 MB cask 名称表），数据文件 28 KB + cask 缓存。
 线程 3 个，句柄 60 上下。跑满两轮检查后内存不再上涨，没有泄漏。
 
 ## 性能

@@ -48,36 +48,61 @@ final class UpdateService: ObservableObject {
 
     // MARK: - 检测
 
-    func checkAll() {
+    /// 同时最多跑几个网络请求。之前是「6 个一批、等一批全完再下一批」，
+    /// 一批里最慢的那个（国内常有 10 秒级的响应）会拖住整批；改成滑动窗口，
+    /// 谁先回来就立刻补一个进去，总耗时接近「总请求数 / 并发数」。
+    private static let maxConcurrentChecks = 12
+
+    /// force = false（定时、启动）：结果还新鲜的 App 直接跳过，只补查过期的
+    /// force = true（用户点「检查更新」或刷新按钮）：全部重查
+    func checkAll(force: Bool = false) {
         guard !checking else { return }
         if apps.isEmpty { rescan() }
+
+        // 这里用的是 settings.intervalHours：每 6 小时检查一次，就不会每 6 小时里反复查
+        let ttl = max(0.25, settings.intervalHours) * 3600
+        let cutoff = Date().addingTimeInterval(-ttl)
+
         let targets = apps
             .filter { !settings.ignored.contains($0.id) }
+            .filter { app in
+                guard !force else { return true }
+                guard let r = results[app.id] else { return true }
+                return r.checkedAt < cutoff
+            }
             .sorted { priority($0) > priority($1) }
         guard !targets.isEmpty else { return }
 
         checking = true
         progress = 0
         let total = Double(targets.count)
+        let started = Date()
 
         Task { [weak self] in
             guard let self else { return }
-            let batchSize = 6
-            var index = 0
-            while index < targets.count {
-                let end = min(index + batchSize, targets.count)
-                let slice = Array(targets[index..<end])
-                await withTaskGroup(of: CheckResult.self) { group in
-                    for app in slice {
-                        group.addTask { await Checker.check(app) }
-                    }
-                    for await result in group {
-                        self.results[result.bundleId] = result
-                    }
+            var done = 0
+            await withTaskGroup(of: CheckResult.self) { group in
+                var next = targets.makeIterator()
+                var inFlight = 0
+
+                // 先塞满并发槽位
+                while inFlight < Self.maxConcurrentChecks, let app = next.next() {
+                    group.addTask { await Checker.check(app) }
+                    inFlight += 1
                 }
-                index = end
-                self.progress = Double(index) / total
-                self.rebuild()
+
+                while let result = await group.next() {
+                    self.results[result.bundleId] = result
+                    done += 1
+                    inFlight -= 1
+                    // 回来一个就补一个，别等整批
+                    if let app = next.next() {
+                        group.addTask { await Checker.check(app) }
+                        inFlight += 1
+                    }
+                    self.progress = Double(done) / total
+                    if done % 4 == 0 || done == targets.count { self.rebuild() }
+                }
             }
             self.settings.lastCheck = Date()
             self.lastCheck = self.settings.lastCheck
@@ -85,6 +110,10 @@ final class UpdateService: ObservableObject {
             self.progress = 1
             self.save()
             self.notifyIfNeeded()
+            if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
+                let ms = Int(Date().timeIntervalSince(started) * 1000)
+                FileHandle.standardError.write("[UR] 本轮查了 \(targets.count) 个 App，用时 \(ms) ms\n".data(using: .utf8)!)
+            }
         }
     }
 
@@ -219,8 +248,23 @@ final class UpdateService: ObservableObject {
 
     // MARK: - 动作
 
+    /// 「打开下载页」：直达更新源的下载地址（商店页 / dmg / GitHub Release）
     func openUpdate(for row: AppRow) {
         if let s = row.result?.downloadURL, let url = URL(string: s) {
+            NSWorkspace.shared.open(url)
+        } else {
+            reveal(row.app)
+        }
+    }
+
+    /// 左键点一行：去软件自己的官网（不下载、不跳商店产品页）
+    func openSite(for row: AppRow) {
+        let site = row.result?.homepage ?? row.result?.downloadURL
+        if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
+            let line = "[UR] 左键打开：\(row.app.name) → \(site ?? "（无，改为在 Finder 中显示）")\n"
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
+        if let s = site, let url = URL(string: s) {
             NSWorkspace.shared.open(url)
         } else {
             reveal(row.app)

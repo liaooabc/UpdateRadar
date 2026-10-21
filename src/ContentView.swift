@@ -120,7 +120,7 @@ struct ContentView: View {
             Spacer()
             Button {
                 service.rescan()
-                service.checkAll()
+                service.checkAll(force: true)
             } label: {
                 Image(systemName: "arrow.clockwise")
                     .font(.system(size: 13, weight: .medium))
@@ -326,14 +326,7 @@ struct ContentView: View {
                     Text("每天").tag(24.0)
                 }
                 Divider()
-                Toggle("只显示有检测源的 App", isOn: Binding(
-                    get: { service.settings.hideUnknown },
-                    set: { service.setHideUnknown($0) }
-                ))
-                Toggle("有新版本时通知我", isOn: Binding(
-                    get: { service.settings.notifyEnabled },
-                    set: { service.setNotify($0) }
-                ))
+                // 顺序（用户定稿）：菜单栏显示数量 → 打开系统通知设置 → 有新版本时通知我 → 只显示有检测源的 App
                 Toggle("菜单栏显示数量", isOn: Binding(
                     get: { service.settings.countVisible },
                     set: { service.setShowCount($0) }
@@ -343,11 +336,19 @@ struct ContentView: View {
                         NSWorkspace.shared.open(url)
                     }
                 }
+                Toggle("有新版本时通知我", isOn: Binding(
+                    get: { service.settings.notifyEnabled },
+                    set: { service.setNotify($0) }
+                ))
+                Toggle("只显示有检测源的 App", isOn: Binding(
+                    get: { service.settings.hideUnknown },
+                    set: { service.setHideUnknown($0) }
+                ))
                 Divider()
                 Button("打开数据文件夹") {
                     NSWorkspace.shared.open(UpdateService.supportDir)
                 }
-                Button("退出更新雷达") {
+                Button("退出") {
                     NSApp.terminate(nil)
                 }
             } label: {
@@ -419,25 +420,27 @@ struct RowView: View {
         .contentShape(Rectangle())
         .onHover { hover.on = $0 }
         .onTapGesture {
-            service.openUpdate(for: row)
+            // 左键：去官网（不是商店产品页、也不是直接下 dmg）
+            service.openSite(for: row)
         }
         .contextMenu {
+            // 顺序：打开下载页 → 打开这个 App → 在 Finder 中显示
             if row.result?.downloadURL != nil {
                 Button("打开下载页") { service.openUpdate(for: row) }
             }
-            Button("在 Finder 中显示") { service.reveal(row.app) }
             Button("打开这个 App") { service.launch(row.app) }
+            Button("在 Finder 中显示") { service.reveal(row.app) }
             Divider()
             if row.isUpdate {
-                Button("这个已经是最新（不再提醒）") { service.dismiss(row) }
+                Button("这个已经是最新") { service.dismiss(row) }
             }
             if service.isDismissed(row.id) {
                 Button("恢复提醒") { service.undismiss(row.id) }
             }
             if ignored {
-                Button("恢复提醒（不再忽略）") { service.unignore(row.id) }
+                Button("恢复提醒") { service.unignore(row.id) }
             } else {
-                Button("忽略它（不再提醒）") { service.ignore(row.app) }
+                Button("忽略它") { service.ignore(row.app) }
             }
         }
     }

@@ -27,6 +27,9 @@ struct CheckResult: Identifiable, Codable, Equatable {
     var status: CheckStatus
     var latest: String?
     var downloadURL: String?
+    /// 软件自己的官网（不是下载直链、也不是商店的产品页）。
+    /// 左键点一行用它；「打开下载页」才用 downloadURL。
+    var homepage: String?
     var note: String?
     var source: String?     // sparkle / appstore / vendor / manual
     var checkedAt: Date
