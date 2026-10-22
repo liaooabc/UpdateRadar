@@ -93,7 +93,7 @@
 | 单次检查进行中 | 峰值 ~77 MB，结束后回落 | 短暂 10% 左右 |
 | 面板打开 | ~50 MB | 0.0% |
 
-磁盘：App 本身 3.4 MB（1.9 MB 图标资源 + 0.7 MB cask 名称表），数据文件 28 KB + cask 缓存。
+磁盘：App 本身 3.6 MB（2.2 MB 图标资源 + 0.7 MB cask 名称表），数据文件 28 KB + cask 缓存。
 线程 3 个，句柄 60 上下。跑满两轮检查后内存不再上涨，没有泄漏。
 
 ## 性能
@@ -120,16 +120,51 @@
 
 ## 图标
 
-- 设计：近黑超椭圆底 + 青绿圆润箭头 + 底部横线，靠近 macOS 26 原生深色图标的观感
-  （深色底 + 高饱和字形 + 一层很淡的辉光）。
-- 用 macOS 26 的 `.icon` 格式（Xcode 自带的 Icon Composer 格式），构建时由 `actool` 编译成
-  `Assets.car`，圆角、材质、高光交给系统渲染，不再自己烘焙 squircle。
-- 源文件在 `build/AppIcon.icon`（构建时生成），可以直接用 Xcode → Open Developer Tool →
-  Icon Composer 打开继续编辑。
-- **注意**：真正的「日间/夜间两套不同画面」必须在这个 GUI 工具里画。命令行 `actool` 编译 macosx
-  平台时会静默丢弃资源目录里的暗色变体（`appearances: luminosity/dark`），`.icon` 里的
-  `light-tint`/`dark-tint`、图层级 `appearance`、分组级 `appearances` 三种写法也都验证过不被接受。
-  所以当前是一套画面通吃两种外观（青绿底在深浅背景下都清晰），不是两张不同的图。
+- **设计源文件：`Resources/AppIcon.icon`**（Icon Composer 文档，`icon.json` + `Assets/*.svg`）。
+  想改配色/形状，用 Xcode → Open Developer Tool → Icon Composer 打开它改，
+  或者直接改 `Assets/*.svg`（纯文本，颜色写在 `stop-color` 里）。
+- 构建时 `build.sh` 把它拷到 `build/AppIcon.icon`（actool 只认这个位置），
+  再用 `actool` 编成 `Assets.car` + `AppIcon.icns` 塞进 App。
+- **四个图层，白天 / 暗夜各一套**（由 `icon.json` 里每层的 `opacity-specializations` 互斥切换）：
+
+  | 图层 | 内容 | 白天 | 暗夜 |
+  |---|---|---|---|
+  | 3_Arrow | 下载箭头（76px 圆头粗线，竖杆 + 折线箭头） | `#5AB0FF → #007AFF` | `#7BD0FF → #0A84FF` |
+  | 2_Ring | 外圈光环（r≈354，132px 环宽） | `#FFFFFF → #B9C2C9` | `#3A4046 → #15181B` |
+  | 1_Plate | 中间灰色圆盘（r=288，径向渐变） | `#7C8288 → #4E5459` | `#2E3338 → #14171A` |
+  | 0_Bg | 底板（**在下面那组**，带 0.3 半透明 + 阴影） | `#FFFFFF → #EAEFF2` | `#141414 → #000` |
+
+  前景组带 `shadow: 0.5`，底板组带 `translucency: 0.3 + shadow: 0.3` —— 所以图标有
+  分层悬浮的立体感，不是一张平面图。`Assets/` 里还留着几个旧版绿色图层
+  （`01-arcs-*`、`02-arrow-*`、`03-base-*`），`icon.json` 没引用它们，actool 会忽略。
+- **关键写法（别再走弯路）**：明暗两套要靠 `opacity-specializations`，不是 `image-name-specializations`。
+  一个 group 里放两份图层，各自在对方外观下把不透明度设为 0：
+
+  ```json
+  { "image-name" : "03-arrow-day.svg", "name" : "3_Arrow_Day",
+    "opacity-specializations" : [ { "appearance" : "dark", "value" : 0.0 } ] }
+  { "image-name" : "03-arrow-night.svg", "name" : "3_Arrow_Night",
+    "opacity-specializations" : [ { "appearance" : "light", "value" : 0.0 },
+                                  { "appearance" : "tinted", "value" : 0.0 } ] }
+  ```
+
+  验证办法：`xcrun assetutil --info Assets.car` 里的 `IconGroup`，在
+  `NSAppearanceNameAqua` / `NSAppearanceNameDarkAqua` 下各层的 `LayerOpacity` 必须正好 1 / 0 互换。
+  渲染预览（六种外观）：
+  `"/Applications/Xcode.app/Contents/Applications/Icon Composer.app/Contents/Executables/ictool" Resources/AppIcon.icon --export-image --output-file /tmp/a.png --platform macOS --rendition Dark --width 512 --height 512 --scale 1`
+- **分组顺序：`groups[0]` 在上、`groups[1]` 在下**。底板必须放最后一个组，否则会把前景盖成淡色；
+  组内则是第一个图层在最前。
+- `tinted`（系统「着色」外观）里底板两层都是 0：那块底色交给系统自己的着色玻璃，只留前景图形。
+- 上一版**墨绿色 + 两道雷达波**的图标留了备份在 `Resources/AppIcon-green.icon`，
+  想换回去：`rsync -a --delete Resources/AppIcon-green.icon/ Resources/AppIcon.icon/ && ./build.sh`。
+- **踩过的坑（都别再试）**：
+  - `image-name-specializations`（图层级指定暗色用哪张图）：`actool` **静默丢弃**，只剩一张。
+  - 资源目录（`AppIcon.appiconset`）里的 `appearances: luminosity/dark`：mac 平台同样被丢，10 个尺寸只剩亮的。
+  - `actool` 的输出目录**必须是 `mktemp -d` 的临时目录**，直接写进「文稿」下的 `build/` 会报
+    `BOMStorageCompact ... rename failed Operation not permitted`，只留个半成品和 `tmp.XXXX`。
+  - `actool` 对**别的路径**的 `.icon` 会静默不产出（连错误都没有）；老老实实用 `build/AppIcon.icon`。
+  - SVG 的 y 轴在渲染时是反的：`linearGradient` 的 `offset 0` 那端落在图标**底部**，写反渐变方向就颠倒。
+  - 线宽别改细：原来的细线在 32px（1024 缩 32 倍）下只剩零点几像素，会断成噪点。
 
 ## 文件位置
 

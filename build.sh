@@ -20,37 +20,22 @@ DEVELOPER_DIR="$CLT_DEV" swiftc -O -whole-module-optimization \
     -o "$APP/Contents/MacOS/UpdateRadar" \
     "$SRC"/*.swift
 
-echo "▸ 图标（日间 + 夜间）"
-ICON_BIN="$BUILD/make_icon"
-if [ ! -x "$ICON_BIN" ] || [ "$ROOT/tools/make_icon.swift" -nt "$ICON_BIN" ]; then
-    DEVELOPER_DIR="$CLT_DEV" swiftc -O -target arm64-apple-macosx15.0 -o "$ICON_BIN" "$ROOT/tools/make_icon.swift"
-fi
-# 单张成品图（给 .icns 兜底用）
-"$ICON_BIN" art "$BUILD/icon_art_1024.png" 1024
+echo "▸ 图标（Icon Composer 图层包：底板 / 圆盘 / 光环 / 箭头，白天 + 暗夜）"
+ICON_DOC="$ROOT/Resources/AppIcon.icon"      # 设计源文件（8 个 SVG + icon.json，可再用 Icon Composer 打开改）
+ICON_PKG="$BUILD/AppIcon.icon"               # actool 只认这个位置，换路径会静默不产出
+ICON_BIN="$BUILD/make_icon"                  # 兜底：万一 .icon 编不出来，用代码现画一套
 
-ICON_PKG="$BUILD/AppIcon.icon"
-rm -rf "$ICON_PKG"; mkdir -p "$ICON_PKG/Assets"
-"$ICON_BIN" bleed "$ICON_PKG/Assets/art.png" 1024
-cat > "$ICON_PKG/icon.json" <<'JSON'
-{
-  "groups" : [
-    { "layers" : [ { "image-name" : "art.png", "name" : "art" } ] }
-  ],
-  "supported-platforms" : { "squares" : ["macOS"] }
+build_icon_bin() {
+    if [ ! -x "$ICON_BIN" ] || [ "$ROOT/tools/make_icon.swift" -nt "$ICON_BIN" ]; then
+        DEVELOPER_DIR="$CLT_DEV" swiftc -O -target arm64-apple-macosx15.0 -o "$ICON_BIN" "$ROOT/tools/make_icon.swift"
+    fi
 }
-JSON
 
-mkdir -p "$BUILD/actool-out"
-if DEVELOPER_DIR="$XCODE_DEV" xcrun actool --compile "$BUILD/actool-out" \
-     --platform macosx --minimum-deployment-target 15.0 \
-     --app-icon AppIcon --output-partial-info-plist "$BUILD/icon-partial.plist" \
-     "$ICON_PKG" >/dev/null 2>"$BUILD/actool.log"; then
-    cp "$BUILD/actool-out/Assets.car" "$APP/Contents/Resources/Assets.car"
-    cp "$BUILD/actool-out/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
-    echo "  .icon 已编译 → Assets.car（含 Aqua / DarkAqua 两套）"
-else
-    echo "  ⚠ actool 失败，退回单套 .icns"
-    sed -n '1,6p' "$BUILD/actool.log"
+# 兜底方案：单套 .icns（没有图层、不跟明暗切换，只在 actool 失败时用）
+fallback_icns() {
+    echo "  ⚠ 退回单套 .icns（不带明暗切换）"
+    build_icon_bin
+    "$ICON_BIN" art "$BUILD/icon_art_1024.png" 1024 dark
     ICONSET="$BUILD/AppIcon.iconset"; rm -rf "$ICONSET"; mkdir -p "$ICONSET"
     for s in 16 32 64 128 256 512; do
         sips -z $s $s "$BUILD/icon_art_1024.png" --out "$ICONSET/icon_${s}x${s}.png" >/dev/null
@@ -59,6 +44,34 @@ else
     done
     cp "$BUILD/icon_art_1024.png" "$ICONSET/icon_512x512@2x.png"
     iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+}
+
+if [ -f "$ICON_DOC/icon.json" ]; then
+    rm -rf "$ICON_PKG"
+    cp -R "$ICON_DOC" "$ICON_PKG"
+
+    # actool 的输出目录放在 /tmp：直接在「文稿」下的 build/ 里写 Assets.car 时，
+    # 它内部的 BOMStorageCompact 会报 "rename failed Operation not permitted"（沙箱/ACL 的锅），
+    # 结果只留下一个半成品和 tmp.XXXX。先把产物写进临时目录，再拷回来。
+    ACTOOL_OUT="$(mktemp -d)/actool-out"
+    mkdir -p "$ACTOOL_OUT"
+    if DEVELOPER_DIR="$XCODE_DEV" xcrun actool --compile "$ACTOOL_OUT" \
+         --platform macosx --minimum-deployment-target 26.0 \
+         --app-icon AppIcon --output-partial-info-plist "$BUILD/icon-partial.plist" \
+         "$ICON_PKG" >/dev/null 2>"$BUILD/actool.log"; then
+        cp "$ACTOOL_OUT/Assets.car" "$APP/Contents/Resources/Assets.car"
+        cp "$ACTOOL_OUT/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+        # 自查：白天 / 暗夜两套图层的 LayerOpacity 必须正好互换，否则等于没做明暗
+        LAYERS=$(xcrun assetutil --info "$APP/Contents/Resources/Assets.car" 2>/dev/null \
+                 | grep -c '"AssetType" : "Vector"' || true)
+        echo "  .icon 已编译 → Assets.car（矢量图层条目：$LAYERS，含 Aqua / DarkAqua / Tinted 三套）"
+    else
+        sed -n '1,8p' "$BUILD/actool.log"
+        fallback_icns
+    fi
+else
+    echo "  没找到 Resources/AppIcon.icon，用 make_icon.swift 现画"
+    fallback_icns
 fi
 
 echo "▸ 资源（Homebrew Cask 名称表）"

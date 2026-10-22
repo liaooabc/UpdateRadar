@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="plate" cx="0.42" cy="0.34" r="0.78">
+      <stop offset="0" stop-color="#2E3338"/>
+      <stop offset="1" stop-color="#14171A"/>
+    </radialGradient>
+  </defs>
+  <circle cx="512.0" cy="512.0" r="288.0" fill="url(#plate)"/>
+</svg>
