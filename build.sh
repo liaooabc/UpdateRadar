@@ -71,10 +71,13 @@ if [ -f "$ICON_DOC/icon.json" ]; then
     # 结果只留下一个半成品和 tmp.XXXX。先把产物写进临时目录，再拷回来。
     ACTOOL_OUT="$(mktemp -d)/actool-out"
     mkdir -p "$ACTOOL_OUT"
+    # 一次 actool 编两个 catalog：AppIcon.icon（Dock 图标，明暗双模）+ Assets.xcassets
+    # （菜单栏那张模板图）。两个必须编进同一个 Assets.car，NSImage(named:) 才找得到。
+    MENUBAR_CATALOG="$ROOT/Resources/Assets.xcassets"
     if DEVELOPER_DIR="$XCODE_DEV" xcrun actool --compile "$ACTOOL_OUT" \
          --platform macosx --minimum-deployment-target 26.0 \
          --app-icon AppIcon --output-partial-info-plist "$BUILD/icon-partial.plist" \
-         "$ICON_PKG" >/dev/null 2>"$BUILD/actool.log"; then
+         "$ICON_PKG" "$MENUBAR_CATALOG" >/dev/null 2>"$BUILD/actool.log"; then
         cp "$ACTOOL_OUT/Assets.car" "$APP/Contents/Resources/Assets.car"
         cp "$ACTOOL_OUT/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
         # 自查：白天 / 暗夜两套图层的 LayerOpacity 必须正好互换，否则等于没做明暗

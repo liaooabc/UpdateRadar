@@ -6,13 +6,15 @@
 ## 怎么用
 
 - 菜单栏右上角出现一个 ⬇ 图标：始终是黑色模板图（系统按菜单栏明暗自动换成白），有更新时可显示数量（如 `14`）。
-- 菜单栏图标是自绘的模板图：18pt 的圆圈 + 圆润箭头，跟最初那版一模一样（尺寸别再动，试过 13pt 被否了）。
-  只做黑白模板，**不做彩色**（红色那版也试过，同样被否：菜单栏还是原来的样子）。
-  见 `main.swift` 的 `makeStatusIcon()`。
+- 菜单栏图标是**矢量模板图**：`Resources/Assets.xcassets/UpdateRadarMenuBar`（圆环 + 下箭头）。
+  只做黑白模板，**不做彩色**（红色那版试过，被否）。
+  - 尺寸按「圆环看起来 17pt」定：SVG 外框 22、环只占 17.2/22，所以代码里把图设成 22pt，
+    画出来环 ≈17.2pt，跟最早那版自绘（18pt 框、环 17.4pt）视觉一样大。**别再改成 18，会明显小一圈。**
+  - 兜底：万一 asset 没编进去，`makeStatusIcon()` 会退回代码现画的那版（见 `main.swift`）。
 - 角标跟着 `updateCount` 走：后台查完会自己刷新，不用等点一下图标。
 - **左键**点图标 → 弹出面板。
-- **右键**点图标 → 直接弹出菜单：关于 / 检查频率 / 只显示有检测源的 App / 有新版本时通知我 / 菜单栏显示数量 /
-  打开数据文件夹 / 打开系统通知设置 / 检查更新（⌘R）/ 退出（⌘Q）。
+- **右键**点图标 → 直接弹出菜单，只有 6 项：关于 / 检查频率 / 菜单栏显示数量 / 有新版本时通知我 /
+  检查更新（⌘R）/ 退出（⌘Q）。
   实现上用的是「临时把 NSMenu 挂到 statusItem 再 performClick」的标准做法；
   早先用 `menu.popUp(positioning:at:in:)` 手动定位会把菜单第一项裁掉。
 - 面板用系统自己的 **NSPopover**（`.transient`，点别处或按 Esc 自己收起）：
@@ -134,6 +136,19 @@
   或者直接改 `Assets/*.svg`（纯文本，颜色写在 `stop-color` 里）。
 - 构建时 `build.sh` 把它拷到 `build/AppIcon.icon`（actool 只认这个位置），
   再用 `actool` 编成 `Assets.car` + `AppIcon.icns` 塞进 App。
+
+### 菜单栏那张小图（跟 Dock 图标是两套东西）
+
+菜单栏走 **template rendering**：只保留 alpha，系统按菜单栏明暗自动反色，所以**不需要明暗双模**，
+只要一份单色剪影 —— `Resources/Assets.xcassets/UpdateRadarMenuBar.imageset/UpdateRadarMenuBar.svg`。
+
+- 改图：直接编辑那个 SVG（`stroke-width` 就是粗细），存盘后 `./build.sh` 重编。
+- 它和 `AppIcon.icon` **必须编进同一个 `Assets.car`**，`NSImage(named:)` 才找得到：
+  `build.sh` 里那一行 `actool ... "$ICON_PKG" "$MENUBAR_CATALOG"` 就是干这个的，别拆成两次调用。
+- `Contents.json` 里两个键都不能少：`template-rendering-intent: template`（模板渲染）、
+  `preserves-vector-representation: true`（保矢量，不然 Retina 下会糊）。
+- **注意 y 轴**：Xcode 解析 SVG 是按 y 向下画的，跟浏览器一致，不会自动翻。
+  做「下载箭头」时箭尖的 y 要比箭杆末端**大**（原稿就写反了，编出来是朝上的）。
 - **四个图层，白天 / 暗夜各一套**（由 `icon.json` 里每层的 `opacity-specializations` 互斥切换）：
 
   | 图层 | 内容 | 白天 | 暗夜 |

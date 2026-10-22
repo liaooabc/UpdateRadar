@@ -126,6 +126,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 菜单栏图标：18pt 的自绘模板图（圆圈 + 圆润箭头），跟最初那版一模一样。
     /// 走模板图，黑色由系统按菜单栏明暗自动换成白 —— 不做彩色、不缩放。
     private func makeStatusIcon() -> NSImage {
+        // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/UpdateRadarMenuBar.svg）：
+        // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
+        //
+        // 尺寸：SVG 的外框是 22，圆环只占 17.2/22；按 22pt 画出来圆环才是 17.2pt，
+        // 跟旧版自绘（18pt 框、环 ≈17.4pt）视觉一样大。改成 18pt 会明显小一圈。
+        let assetSide: CGFloat = 22
+        if let asset = NSImage(named: "UpdateRadarMenuBar")?.copy() as? NSImage {
+            asset.size = NSSize(width: assetSide, height: assetSide)
+            asset.isTemplate = true
+            return asset
+        }
+
+        // 兜底：asset 没编进去时（比如 actool 失败），继续用代码现画的 18pt 那版
         let side: CGFloat = 18
         let img = NSImage(size: NSSize(width: side, height: side), flipped: false) { _ in
             NSColor.black.setFill()

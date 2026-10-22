@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22">
+  <!--
+    更新雷达 · 菜单栏图标（template image）
+
+    菜单栏走 template 渲染：只保留 alpha，系统按菜单栏明暗自动反色。
+    因此不需要明暗双模，只需这一份单色剪影。
+
+    关键约束（与 Dock 图标完全不同）：
+    · 实际显示约 17pt，比 Dock 小得多 → 笔画要比 Dock 版粗一档
+    · 元素 ≤ 3（环 + 杆 + 箭头），再多会糊
+    · 四周留白 ≥ 10%（内容占 16/22）
+    · 全部圆头圆角，与 Dock 版同一笔触语言
+
+    注意 y 轴：SVG 是 y 向下，箭头要朝下（下载），所以箭尖的 y 比箭杆末端大。
+    （原稿把箭头写反了，渲染出来是朝上；Xcode 的 SVG 解析按 y 向下画，不会自动翻。）
+  -->
+  <g fill="none" stroke="#000" stroke-linecap="round" stroke-linejoin="round">
+    <!-- 雷达扫描盘 -->
+    <circle cx="11" cy="11" r="7.6" stroke-width="2"/>
+    <!-- 箭杆 -->
+    <line x1="11" y1="6.6" x2="11" y2="13.6" stroke-width="2.9"/>
+    <!-- 箭头（朝下） -->
+    <polyline points="6.7,11.8 11,15.8 15.3,11.8" stroke-width="2.9"/>
+  </g>
+</svg>
