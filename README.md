@@ -155,8 +155,6 @@
 - **分组顺序：`groups[0]` 在上、`groups[1]` 在下**。底板必须放最后一个组，否则会把前景盖成淡色；
   组内则是第一个图层在最前。
 - `tinted`（系统「着色」外观）里底板两层都是 0：那块底色交给系统自己的着色玻璃，只留前景图形。
-- 上一版**墨绿色 + 两道雷达波**的图标留了备份在 `Resources/AppIcon-green.icon`，
-  想换回去：`rsync -a --delete Resources/AppIcon-green.icon/ Resources/AppIcon.icon/ && ./build.sh`。
 - **踩过的坑（都别再试）**：
   - `image-name-specializations`（图层级指定暗色用哪张图）：`actool` **静默丢弃**，只剩一张。
   - 资源目录（`AppIcon.appiconset`）里的 `appearances: luminosity/dark`：mac 平台同样被丢，10 个尺寸只剩亮的。

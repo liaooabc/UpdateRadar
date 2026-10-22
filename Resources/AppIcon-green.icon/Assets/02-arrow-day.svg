@@ -1,9 +1,0 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-  <defs>
-    <linearGradient id="ar" x1="0" y1="0" x2="0.2" y2="1">
-      <stop offset="0" stop-color="#2FB392"/>
-      <stop offset="1" stop-color="#12866A"/>
-    </linearGradient>
-  </defs>
-  <path d="M 438.00 310.00 A 74.0 74.0 0 0 1 586.00 310.00 L 586.00 452.00 L 672.00 452.00 Q 738.00 452.00 699.61 505.68 L 545.74 720.82 Q 512.00 768.00 478.26 720.82 L 324.39 505.68 Q 286.00 452.00 352.00 452.00 L 516.00 452.00 A 78.0 78.0 0 0 0 438.00 530.00 L 438.00 310.00 Z" fill="url(#ar)"/>
-</svg>
