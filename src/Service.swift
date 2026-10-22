@@ -17,12 +17,8 @@ final class UpdateService: ObservableObject {
     private var timer: Timer?
     private var didBootstrap = false
 
-    static let supportDir: URL = {
-        let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-        let dir = base.appendingPathComponent("UpdateRadar", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir
-    }()
+    // 真正的实现在 Models.swift 的 URSupportDir：Cask 枚举在并发 Task 里也要用它
+    static let supportDir: URL = URSupportDir
 
     private var storeURL: URL { Self.supportDir.appendingPathComponent("state.json") }
 
@@ -42,6 +38,15 @@ final class UpdateService: ObservableObject {
 
     func rescan() {
         apps = Scanner.scan()
+        // 只清「已卸载 App 的检测结果」，别动 ignored / dismissed：
+        // 外接盘拔掉、或某次扫描抖动时 App 会临时扫不到，一清就把用户
+        // 手动「忽略它 / 这个已经是最新」的记录抹了，下次又全冒出来。
+        let live = Set(apps.map(\.id))
+        let stale = results.keys.filter { !live.contains($0) }
+        if !stale.isEmpty {
+            for k in stale { results.removeValue(forKey: k) }
+            save()
+        }
         appCount = apps.count
         rebuild()
     }

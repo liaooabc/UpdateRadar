@@ -1,6 +1,15 @@
 import AppKit
 import Foundation
 
+/// 数据目录。不挂在 UpdateService 上：Cask 枚举在后台并发 Task 里要用它，
+/// 而 UpdateService 是 @MainActor 隔离的（Swift 6 语言模式下会硬报错）。
+let URSupportDir: URL = {
+    let base = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+    let dir = base.appendingPathComponent("UpdateRadar", isDirectory: true)
+    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}()
+
 struct InstalledApp: Identifiable, Hashable {
     let id: String          // bundleIdentifier，没有就用路径
     let name: String
@@ -72,6 +81,14 @@ struct AppRow: Identifiable {
     var isUpdate: Bool { status == .updateAvailable }
     var hasSource: Bool { (result?.source != nil && result?.source != "manual") || result?.status == .failed }
 
+    /// 把「GitHub 接口限流（未登录时每小时 60 次…）」这类长 note 压成一句短的
+    static func shortReason(_ note: String) -> String? {
+        let head = note.split(whereSeparator: { "（(，,；;：:".contains($0) }).first.map(String.init) ?? note
+        let trimmed = head.trimmingCharacters(in: .whitespaces)
+        guard !trimmed.isEmpty else { return nil }
+        return trimmed.count <= 12 ? trimmed : String(trimmed.prefix(12)) + "…"
+    }
+
     var subtitle: String {
         switch status {
         case .updateAvailable:
@@ -88,7 +105,11 @@ struct AppRow: Identifiable {
             }
             return app.version
         case .failed:
-            // 状态字在右边那列（⚠ 检测失败），副标题只留版本号，不重复
+            // 状态字在右边那列（⚠ 检测失败），副标题不重复状态字；
+            // 有 note 就带一句「为什么失败」，太长的截断（完整原文在悬停提示里）
+            if let n = result?.note, let short = AppRow.shortReason(n) {
+                return "\(app.version)　·　\(short)"
+            }
             return app.version
         case .unknown:
             return app.version

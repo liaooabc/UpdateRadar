@@ -10,6 +10,22 @@ SRC="$ROOT/src"
 BUILD="$ROOT/build"
 APP="$BUILD/更新雷达.app"
 
+echo "▸ 并发自检（Swift 6 迁移债，看这个数就行）"
+CONC_LOG="$(mktemp)"
+if DEVELOPER_DIR="$CLT_DEV" swiftc -typecheck -strict-concurrency=complete \
+     -target arm64-apple-macosx15.0 "$SRC"/*.swift >"$CONC_LOG" 2>&1; then
+    CONC_N=$(grep -oE "static property '[^']+'" "$CONC_LOG" | sort -u | wc -l | tr -d ' ')
+    if [ "${CONC_N}" -eq 0 ]; then
+        echo "  0 条，Swift 6 可以直接迁"
+    else
+        echo "  ${CONC_N} 条（不影响 Swift 5 编译，但 Swift 6 语言模式下会变成错误）："
+        grep -oE "static property '[^']+'" "$CONC_LOG" | sort -u | sed 's/^/    /'
+    fi
+else
+    echo "  自检没编过，跳过（真正的编译在下一步，报错会打在那里）"
+fi
+rm -f "$CONC_LOG"
+
 echo "▸ 清理"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"

@@ -65,6 +65,8 @@
    注意区分营销版本号（`<title>` / `sparkle:shortVersionString`）和内部构建号（`sparkle:version`）——构建号不能拿来和版本号比。
    抓失败时先交给第 4 层兜一次，别急着把行标成「检测失败」。
 3. **Mac App Store**：带 `_MASReceipt` 的 App 用 `itunes.apple.com/lookup?bundleId=` 查商店版本。
+   lookup 是**分区**的：国区没上架的 App 在 `country=cn` 下返回 `resultCount=0`，会像「不在商店」，
+   所以国区查不到时再试一次 `country=us`（只在没命中时才多发一个请求）。实测 Slack：cn=0 / us=1。
 4. **Homebrew Cask**（社区维护的版本库，7000+ 个 Mac App，含大量没有 appcast 的商业软件）：
    覆盖 Sketch、Spotify、Telegram、Raycast、Notion、Blender、Zotero、GitHub Desktop、
    Microsoft Office 五件套、Topaz 三件套、Canva、哔哩哔哩、DropDMG、UPDF 等。
@@ -84,6 +86,13 @@
 都没有的 App 记为「无检测源」，仍然列出来但不会打扰你。
 
 网络层有两个容错：请求失败会重试一次；`raw.githubusercontent.com` 的源会走 jsDelivr 镜像兜底（国内常被墙）。
+
+**GitHub API 会限流**：未认证只有 60 次/小时/IP，同一个 Wi-Fi 下几台 Mac 共用配额。
+撞墙时 GitHub 返回 `403 + X-RateLimit-Remaining: 0`（和「仓库没了」的 404 不是一回事），
+所以现在会明确说「GitHub 接口限流」，而不是笼统的「检测失败」。
+
+**「检测失败」会说原因**：行里直接显示一句短的（如「更新源没有响应」「GitHub 接口限流」），
+鼠标停在「⚠ 检测失败」上看完整说明。
 
 ## 资源占用（实测）
 
@@ -163,6 +172,15 @@
   - `actool` 对**别的路径**的 `.icon` 会静默不产出（连错误都没有）；老老实实用 `build/AppIcon.icon`。
   - SVG 的 y 轴在渲染时是反的：`linearGradient` 的 `offset 0` 那端落在图标**底部**，写反渐变方向就颠倒。
   - 线宽别改细：原来的细线在 32px（1024 缩 32 倍）下只剩零点几像素，会断成噪点。
+
+## 数据与自检
+
+- `state.json` 里的检测结果会**随扫描自动清理**：扫不到的 App（已卸载）的结果会被删掉，
+  但「忽略它 / 这个已经是最新」这类**你手动做过的决定不会被清**——外接盘拔了、某次扫描抖动，
+  那些记录都还在。
+- `build.sh` 开头有一段 `-strict-concurrency=complete` 自检，会打印还剩几条并发告警
+  （当前 6 条，都是 `Cask` / `IconCache` 里的静态变量，Swift 5 下无害、Swift 6 会变成错误）。
+  这个数**不要当成 0**：加锁解决的是运行时竞争，编译器不认账。
 
 ## 文件位置
 

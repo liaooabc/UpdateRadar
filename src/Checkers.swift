@@ -232,6 +232,38 @@ enum Net {
         return nil
     }
 
+    /// HTTP 状态码。GitHub 未认证时限流会返回 403 + X-RateLimit-Remaining: 0，
+    /// 和「仓库不存在 / 网络不通」返回的 404 是完全不同的两回事，
+    /// 混成一个 nil 的话上层只能笼统报「检测失败」，用户无从下手。
+    struct HTTPError: Error {
+        let status: Int
+        /// 剩余配额（GitHub 的 X-RateLimit-Remaining），nil 表示该响应没带这个头
+        let rateLimitRemaining: Int?
+        var isRateLimited: Bool {
+            if status == 429 { return true }
+            if status == 403, let r = rateLimitRemaining, r <= 0 { return true }
+            return false
+        }
+    }
+
+    /// GitHub 专用：区分「限流」和「仓库没了」。
+    /// 未认证配额只有 60 次/小时/IP（同一个 Wi-Fi 下几台 Mac 共用），撞墙时要说清原因。
+    static func githubLatestRelease(_ repo: String) async -> Result<[String: Any]?, HTTPError> {
+        let url = "https://api.github.com/repos/\(repo)/releases/latest"
+        guard let u = URL(string: url) else { return .success(nil) }
+        do {
+            let (data, resp) = try await session.data(from: u)
+            guard let http = resp as? HTTPURLResponse else { return .success(nil) }
+            guard (200..<300).contains(http.statusCode) else {
+                let remain = http.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init)
+                return .failure(HTTPError(status: http.statusCode, rateLimitRemaining: remain))
+            }
+            return .success(try? JSONSerialization.jsonObject(with: data) as? [String: Any])
+        } catch {
+            return .success(nil)
+        }
+    }
+
     static func json(_ urlString: String) async -> Any? {
         guard let url = URL(string: urlString) else { return nil }
         do {
@@ -269,10 +301,12 @@ enum Cask {
         var bundles: [String]?     // cask 里登记的 bundle id，用来复核同名不同版
     }
 
-    private static var cacheURL: URL { UpdateService.supportDir.appendingPathComponent("cask-cache.json") }
+    private static var cacheURL: URL { URSupportDir.appendingPathComponent("cask-cache.json") }
 
     /// 名称表随包发布：{"apps": {"sketch.app": "sketch"}, "bundles": {"com.microsoft.Word": "microsoft-word"}}
     private static func loadMap() {
+        // 12 路并发 Task 会同时进来：没这把锁就是两个线程同时写 Dictionary（会真崩）
+        lock.lock(); defer { lock.unlock() }
         guard !mapLoaded else { return }
         mapLoaded = true
         guard let url = Bundle.main.url(forResource: "cask-map", withExtension: "json"),
@@ -445,11 +479,16 @@ enum Checker {
         }
 
         // 3. Mac App Store 上架的应用（不在商店里属于正常情况，算无检测源）
+        // iTunes lookup 是分区的：国区没上架的 App 在 cn 上返回 resultCount=0，
+        // 会被误判成「不在商店」。所以国区查不到时再试一次美区，只在没命中时才多发请求。
         if let bidReal = app.bundleId, app.isAppStore {
-            if let r = await appStore(bundleId: bidReal, current: app.version, installedAt: app.installedAt) {
-                return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
-                                   downloadURL: r.url, homepage: r.homepage, note: nil, source: "appstore",
-                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
+            for country in ["cn", "us"] {
+                if let r = await appStore(bundleId: bidReal, current: app.version,
+                                          installedAt: app.installedAt, country: country) {
+                    return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
+                                       downloadURL: r.url, homepage: r.homepage, note: nil, source: "appstore",
+                                       checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
+                }
             }
         }
 
@@ -504,8 +543,9 @@ enum Checker {
         return nil
     }
 
-    static func appStore(bundleId: String, current: String, installedAt: Date?) async -> Outcome? {
-        let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=cn"
+    static func appStore(bundleId: String, current: String, installedAt: Date?,
+                         country: String) async -> Outcome? {
+        let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=\(country)"
         guard let obj = await Net.json(url) as? [String: Any],
               let count = obj["resultCount"] as? Int, count > 0,
               let results = obj["results"] as? [[String: Any]],
@@ -572,11 +612,20 @@ enum Rules {
 
     /// GitHub Releases 最新 tag
     static func githubRepo(app: InstalledApp, repo: String, downloadPage: String) async -> Checker.Outcome? {
-        let url = "https://api.github.com/repos/\(repo)/releases/latest"
-        guard let obj = await Net.json(url) as? [String: Any],
-              let tag = obj["tag_name"] as? String else { return nil }
-        let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-        return verdict(app, latest: latest, url: downloadPage)
+        switch await Net.githubLatestRelease(repo) {
+        case .failure(let err):
+            if err.isRateLimited {
+                // 403/429 不是「这个 App 坏了」，是配额用完了：如实说，别让用户以为软件出问题
+                return Checker.Outcome(
+                    status: .failed, latest: nil, url: downloadPage, homepage: downloadPage,
+                    note: "GitHub 接口限流（未登录时每小时 60 次，同一网络下多台 Mac 共用配额）；过一会儿再看，或把检查频率调低")
+            }
+            return nil   // 404（仓库没了）和其他状态码：沿用旧行为，当作抓不到
+        case .success(let obj):
+            guard let obj, let tag = obj["tag_name"] as? String else { return nil }
+            let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
+            return verdict(app, latest: latest, url: downloadPage)
+        }
     }
 
     static let all: [VendorRule] = [

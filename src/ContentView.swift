@@ -233,10 +233,10 @@ struct ContentView: View {
                         .padding(.vertical, 4)
                     }
                     .defaultScrollAnchor(.top)
-                    .onChange(of: visibleRows.count) { _ in
+                    .onChange(of: visibleRows.count) {
                         proxy.scrollTo("top", anchor: .top)
                     }
-                    .onChange(of: ui.tab) { _ in
+                    .onChange(of: ui.tab) {
                         proxy.scrollTo("top", anchor: .top)
                     }
                 }
@@ -473,6 +473,8 @@ struct RowView: View {
                     .foregroundStyle(warnAmber)
                 statusText("检测失败")
             }
+            // 为什么失败：副标题只放得下一句短的，完整原文（限流、超时…）放悬停提示
+            .help(row.result?.note ?? "检测失败")
         case .unknown:
             Text("无检测源")
                 .font(.system(size: 9.5))
