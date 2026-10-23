@@ -111,8 +111,9 @@ final class AppcastParser: NSObject, XMLParserDelegate {
     }
 }
 
-/// 更新说明常是 HTML，去掉标签、实体和多余空白，只留能读的字
-func plainNotes(_ raw: String?, limit: Int = 240) -> String? {
+/// 更新说明常是 HTML，去掉标签、实体和多余空白，只留能读的字。
+/// 上限放宽到 1600：列表里只显示一行，但左键点开要看全文。
+func plainNotes(_ raw: String?, limit: Int = 1600) -> String? {
     guard var s = raw else { return nil }
     s = s.replacingOccurrences(of: "(?is)<(script|style)[^>]*>.*?</\\1>", with: " ", options: .regularExpression)
     s = s.replacingOccurrences(of: "(?s)<br\\s*/?>", with: " ", options: .regularExpression)
@@ -532,13 +533,15 @@ enum Checker {
             if notes == nil, newer, let link = it.notesLink, let html = await Net.text(link) {
                 notes = plainNotes(html)
             }
+            // notes 不管是不是新版本都存下来：点开「其他」页里已是最新的 App，
+            // 也该能看到它这一版更新了什么
             return Outcome(status: newer ? .updateAvailable : .upToDate,
                            latest: latest,
                            url: it.enclosure ?? it.link ?? feed,
                            homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
                            note: nil,
                            releaseDate: parseRFC822(it.pubDate),
-                           notes: newer ? notes : nil)
+                           notes: notes)
         }
         return nil
     }
@@ -568,10 +571,11 @@ enum Checker {
         }
 
         let isNewer = Ver.isNewer(latest, than: current)
+        // 同上：不是新版本也留着更新说明，点开能看
         return Outcome(status: isNewer ? .updateAvailable : .upToDate,
                        latest: latest, url: page, homepage: seller, note: nil,
                        releaseDate: release,
-                       notes: isNewer ? plainNotes(first["releaseNotes"] as? String) : nil)
+                       notes: plainNotes(first["releaseNotes"] as? String))
     }
 }
 

@@ -13,6 +13,21 @@ final class UIState: ObservableObject {
     @Published var collapsedGroups: [String: Bool] = [:]
     /// 每一行一个独立的小对象：鼠标划过时只重绘那一行，不动整个列表
     let hovers = HoverStore()
+    /// 哪几行展开了更新说明（左键点一下展开，再点收起）
+    @Published var expanded: Set<String> = []
+
+    /// 刚点开的那一行：列表要把它滚进视野
+    private(set) var lastToggled: String?
+    /// 每一行在列表可视区里的位置（不发布，只给「要不要滚」用，避免滚动时反复重绘）
+    var rowFrames: [String: CGRect] = [:]
+
+    func toggleExpanded(_ id: String) {
+        // 注意：这里必须整体赋值。对 @Published 的 Set 调 insert/remove 是原地改，
+        // 不会经过 setter，也不会发通知，界面（和下面的 onChange）都不会动。
+        let wasOpen = expanded.contains(id)
+        expanded = wasOpen ? expanded.subtracting([id]) : expanded.union([id])
+        lastToggled = id
+    }
 
     init() {
         // 调试用：UPDATERADAR_TAB=1 直接打开「全部」页
@@ -21,6 +36,25 @@ final class UIState: ObservableObject {
         if let keys = ProcessInfo.processInfo.environment["UPDATERADAR_COLLAPSE"] {
             for k in keys.split(separator: ",") { collapsedGroups[String(k)] = true }
         }
+        // 调试用：UPDATERADAR_EXPAND=com.apple.Keynote,... 直接展开这几行，方便截图
+        let env = ProcessInfo.processInfo.environment
+        if let ids = env["UPDATERADAR_EXPAND"] {
+            for id in ids.split(separator: ",") { expanded.insert(String(id)) }
+        }
+        // 调试用：UPDATERADAR_EXPAND_LATE=... 起来五秒后展开，用来看展开时的自动滚动
+        if let ids = env["UPDATERADAR_EXPAND_LATE"], let id = ids.split(separator: ",").first {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+                self?.toggleExpanded(String(id))
+            }
+        }
+    }
+}
+
+/// 每一行在列表里的位置，用来判断「展开后会不会超出面板底部」
+struct RowFrameKey: PreferenceKey {
+    static var defaultValue: [String: CGRect] = [:]
+    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
+        value.merge(nextValue()) { _, new in new }
     }
 }
 
@@ -207,6 +241,8 @@ struct ContentView: View {
                 emptyState
             } else {
                 // 结果行是检查过程中陆续插进来的，滚动位置不会自动回到顶部，所以要手动归位
+                GeometryReader { geo in
+                let viewHeight = geo.size.height
                 ScrollViewReader { proxy in
                     ScrollView {
                         LazyVStack(spacing: 0) {
@@ -234,12 +270,28 @@ struct ContentView: View {
                     }
                     .defaultScrollAnchor(.top)
                     .onChange(of: visibleRows.count) {
-                        proxy.scrollTo("top", anchor: .top)
+                        // 正在读某一行展开的说明时，别因为后台查完了就把列表甩回顶部
+                        if ui.expanded.isEmpty { proxy.scrollTo("top", anchor: .top) }
                     }
                     .onChange(of: ui.tab) {
                         proxy.scrollTo("top", anchor: .top)
                     }
+                    .onPreferenceChange(RowFrameKey.self) { ui.rowFrames = $0 }
+                    // 点开一行时，只有说明会长到面板外面才滚一下；本来整行就在视野里就不动，
+                    // 免得点一下整页跳一格
+                    .onChange(of: ui.expanded) {
+                        guard let id = ui.lastToggled, ui.expanded.contains(id) else { return }
+                        // 等这一帧长高之后再看位置，不然量到的还是展开前的高度
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.03) {
+                            guard let rect = ui.rowFrames[id], rect.maxY > viewHeight - 4 else { return }
+                            withAnimation(.easeInOut(duration: 0.18)) {
+                                proxy.scrollTo(id, anchor: .bottom)
+                            }
+                        }
+                    }
                 }
+                }
+                .coordinateSpace(name: "urList")
             }
         }
         .frame(maxHeight: .infinity)
@@ -248,7 +300,20 @@ struct ContentView: View {
     @ViewBuilder
     private func rowsSection(_ rows: [AppRow], ignored: Bool = false) -> some View {
         ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
-            RowView(row: row, service: service, hover: ui.hovers.box(for: row.id), ignored: ignored)
+            RowView(row: row,
+                    service: service,
+                    hover: ui.hovers.box(for: row.id),
+                    ignored: ignored,
+                    expanded: ui.expanded.contains(row.id),
+                    onToggle: {
+                        // 展开/收起也走动画，行高变化才不生硬
+                        withAnimation(.easeInOut(duration: 0.16)) { ui.toggleExpanded(row.id) }
+                    })
+            .background(GeometryReader { g in
+                Color.clear.preference(key: RowFrameKey.self,
+                                       value: [row.id: g.frame(in: .named("urList"))])
+            })
+            .id(row.id)
             if index < rows.count - 1 {
                 Divider().opacity(0.35).padding(.leading, 46).padding(.trailing, 18)
             }
@@ -366,45 +431,79 @@ struct ContentView: View {
 
 // MARK: - 单行
 
+/// 无边框按钮：按下时压暗一点点并轻微缩小，胶囊才有「按到了」的反馈
+private struct PressablePlainButton: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .brightness(configuration.isPressed ? -0.10 : 0)
+            .scaleEffect(configuration.isPressed ? 0.97 : 1)
+    }
+}
+
 struct RowView: View {
     let row: AppRow
     let service: UpdateService
     @ObservedObject var hover: HoverBox
     var ignored: Bool = false
+    /// 更新说明展开着没
+    var expanded: Bool = false
+    var onToggle: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
             HStack(alignment: .center, spacing: 10) {
-                Image(nsImage: row.app.icon)
-                    .resizable()
-                    .interpolation(.high)
-                    .frame(width: 40, height: 40)
+                // 左半：图标 + 名字 + 版本 + 空白。点这片 = 展开/收起更新说明。
+                // 用真按钮（plain 样式、看不出按钮样）而不是 onTapGesture：
+                // 一是无障碍能用 VoiceOver/键盘点到，二是不会跟右边的「更新」按钮抢点击。
+                Button {
+                    onToggle()
+                } label: {
+                    HStack(alignment: .center, spacing: 10) {
+                        Image(nsImage: row.app.icon)
+                            .resizable()
+                            .interpolation(.high)
+                            .frame(width: 40, height: 40)
 
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(row.app.name)
-                        .font(.system(size: 13, weight: .semibold))
-                        .foregroundStyle(.primary)
-                        .lineLimit(1)
-                    Text(row.subtitle)
-                        .font(.system(size: 10.5))
-                        .monospacedDigit()
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(row.app.name)
+                                .font(.system(size: 13, weight: .semibold))
+                                .foregroundStyle(.primary)
+                                .lineLimit(1)
+                            Text(row.subtitle)
+                                .font(.system(size: 10.5))
+                                .monospacedDigit()
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                        }
+
+                        Spacer(minLength: 8)
+                    }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
+                .help(expanded ? "收起更新说明" : "看这个 App 这次的更新说明")
 
-                Spacer(minLength: 8)
-
+                // 右半：状态字 / 「更新」按钮
                 if ignored {
                     Text("已忽略")
                         .font(.system(size: 10))
                         .foregroundStyle(.tertiary)
-                } else {
+                        .contentShape(Rectangle())
+                        .onTapGesture { onToggle() }
+                } else if row.isUpdate {
                     trailing
+                } else {
+                    // 已是最新 / 检测失败 / 无检测源：这几个只是字，点一下也能展开说明
+                    trailing
+                        .contentShape(Rectangle())
+                        .onTapGesture { onToggle() }
                 }
             }
 
-            // 更新说明：只取第一行，左边缘与图标对齐（跟 App Store 一样）
-            if let notes = row.result?.notes, !notes.isEmpty, row.isUpdate {
+            // 更新说明：收起时只取第一行，左边缘与图标对齐（跟 App Store 一样）
+            if expanded {
+                notesBlock
+            } else if let notes = row.result?.notes, !notes.isEmpty, row.isUpdate {
                 Text(notes)
                     .font(.system(size: 10.5))
                     .foregroundStyle(.secondary)
@@ -416,13 +515,11 @@ struct RowView: View {
         .padding(.leading, 12)
         .padding(.trailing, 18)
         .padding(.vertical, 8)
-        .background(hover.on ? Color.primary.opacity(0.14) : Color.clear)
+        // 展开着的行留一层浅底，一眼能看出「这行是打开的」
+        .background(hover.on ? Color.primary.opacity(0.14)
+                    : (expanded ? Color.primary.opacity(0.05) : Color.clear))
         .contentShape(Rectangle())
         .onHover { hover.on = $0 }
-        .onTapGesture {
-            // 左键：去官网（不是商店产品页、也不是直接下 dmg）
-            service.openSite(for: row)
-        }
         .contextMenu {
             // 顺序：打开下载页 → 打开这个 App → 在 Finder 中显示
             if row.result?.downloadURL != nil {
@@ -445,6 +542,63 @@ struct RowView: View {
         }
     }
 
+    // MARK: - 展开后的更新说明
+
+    /// 更新说明常是「A • B • C」一长串，展开时按 • 断行，读起来才像一份说明
+    private var noteLines: [String] {
+        guard let notes = row.result?.notes else { return [] }
+        let bullet = notes.replacingOccurrences(of: "•", with: "\n• ")
+        let lines = bullet
+            .replacingOccurrences(of: "\r", with: "")
+            .split(separator: "\n", omittingEmptySubsequences: true)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty && $0 != "•" }
+        return lines.isEmpty ? [notes] : lines
+    }
+
+    @ViewBuilder
+    private var notesBlock: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            if noteLines.isEmpty {
+                Text("这个 App 的更新源没带更新说明")
+                    .font(.system(size: 10.5))
+                    .foregroundStyle(.tertiary)
+            } else {
+                VStack(alignment: .leading, spacing: 3) {
+                    ForEach(Array(noteLines.enumerated()), id: \.offset) { _, line in
+                        Text(line)
+                            .font(.system(size: 10.5))
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .textSelection(.enabled)
+            }
+
+            // 左键不再跳官网，去处就摆在这里（右键菜单里也还在）
+            HStack(spacing: 12) {
+                if row.result?.downloadURL != nil {
+                    textButton("打开下载页") { service.openUpdate(for: row) }
+                }
+                if row.result?.homepage != nil {
+                    textButton("官网") { service.openSite(for: row) }
+                }
+                textButton("在 Finder 中显示") { service.reveal(row.app) }
+                Spacer(minLength: 0)
+            }
+        }
+        .padding(.top, 2)
+    }
+
+    private func textButton(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 10.5, weight: .medium))
+                .foregroundStyle(Color.accentColor)
+        }
+        .buttonStyle(.plain)
+    }
+
     /// 状态字只有这一处定义：「已是最新版本」和「检测失败」共用，字体永远一致
     private func statusText(_ text: String) -> some View {
         Text(text)
@@ -456,13 +610,22 @@ struct RowView: View {
     private var trailing: some View {
         switch row.status {
         case .updateAvailable:
-            // 照 App Store 的样子：强调色胶囊 + 白字
-            Text("更新")
-                .font(.system(size: 11.5, weight: .semibold))
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 4.5)
-                .background(Capsule().fill(Color.accentColor))
+            // 照 App Store 的样子：强调色胶囊 + 白字。这个是真按钮：
+            // 点了直接去这个 App 的下载页（dmg / 商店页 / GitHub Release）。
+            // 只想看「改了什么」，点行左边那片，别点这里。
+            Button {
+                service.openUpdate(for: row)
+            } label: {
+                Text("更新")
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 4.5)
+                    .background(Capsule().fill(Color.accentColor))
+                    .contentShape(Capsule())
+            }
+            .buttonStyle(PressablePlainButton())
+            .help("打开「\(row.app.name)」的下载页")
         case .upToDate:
             statusText("已是最新版本")
         case .failed:
