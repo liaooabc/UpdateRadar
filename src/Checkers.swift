@@ -442,9 +442,9 @@ enum Cask {
         return l.dropFirst(c.count).allSatisfy { $0.count >= 6 && $0.allSatisfy(\.isNumber) }
     }
 
-    static func verdict(_ app: InstalledApp, entry: Entry) -> Checker.Outcome {
+    static func verdict(_ app: InstalledApp, entry: Entry, allowBeta: Bool) -> Checker.Outcome {
         // 版本库里记的是测试版时不提示（有些 cask 会跟到 beta 上）
-        if isPrereleaseVersion(entry.version) {
+        if !allowBeta, isPrereleaseVersion(entry.version) {
             return Checker.Outcome(status: .upToDate, latest: app.version,
                                    url: entry.homepage ?? "https://formulae.brew.sh/cask/\(entry.token)",
                                    homepage: entry.homepage,
@@ -468,7 +468,8 @@ enum Cask {
 // MARK: - 检测器
 
 enum Checker {
-    static func check(_ app: InstalledApp) async -> CheckResult {
+    /// - Parameter allowBeta: 用户打开了「接收测试版」时才为 true；默认只跟正式版比
+    static func check(_ app: InstalledApp, allowBeta: Bool = false) async -> CheckResult {
         let bid = app.id
         let now = Date()
 
@@ -479,7 +480,7 @@ enum Checker {
 
         // 1. 厂商专用规则优先（微信这类没有 appcast 的常用软件）
         if let rule = Rules.match(app) {
-            if let r = await rule.run(app) {
+            if let r = await rule.run(app, allowBeta) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
                                    downloadURL: r.url, homepage: r.homepage ?? r.url, note: r.note,
                                    source: "vendor",
@@ -491,7 +492,7 @@ enum Checker {
 
         // 2. Sparkle appcast：34 个 App 走这条路
         if let feed = app.sparkleFeed {
-            if let r = await sparkle(feed: feed, current: app.version) {
+            if let r = await sparkle(feed: feed, current: app.version, allowBeta: allowBeta) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
                                    downloadURL: r.url,
                                    homepage: r.homepage ?? siteFromFeed(feed),
@@ -500,7 +501,7 @@ enum Checker {
             }
             // appcast 这次没抓到：先用社区版本库兜一层，别急着报「检测失败」
             if let entry = await Cask.lookup(app) {
-                return result(app, Cask.verdict(app, entry: entry), source: "cask", now: now)
+                return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
             }
             return failed("更新源没有响应")
         }
@@ -511,7 +512,8 @@ enum Checker {
         if let bidReal = app.bundleId, app.isAppStore {
             for country in ["cn", "us"] {
                 if let r = await appStore(bundleId: bidReal, current: app.version,
-                                          installedAt: app.installedAt, country: country) {
+                                          installedAt: app.installedAt, country: country,
+                                          allowBeta: allowBeta) {
                     return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
                                        downloadURL: r.url, homepage: r.homepage, note: nil, source: "appstore",
                                        checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
@@ -521,7 +523,7 @@ enum Checker {
 
         // 4. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
         if let entry = await Cask.lookup(app) {
-            return result(app, Cask.verdict(app, entry: entry), source: "cask", now: now)
+            return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
         }
 
         return CheckResult(bundleId: bid, status: .unknown, latest: nil,
@@ -546,7 +548,7 @@ enum Checker {
         var notes: String?
     }
 
-    static func sparkle(feed: String, current: String) async -> Outcome? {
+    static func sparkle(feed: String, current: String, allowBeta: Bool) async -> Outcome? {
         guard let body = await Net.text(feed), !body.isEmpty else { return nil }
         let items = AppcastParser().parse(Data(body.utf8))
         guard !items.isEmpty else { return nil }
@@ -561,7 +563,9 @@ enum Checker {
             sawAnyVersioned = true
             let isBeta = (it.channel?.isEmpty == false) || isPrereleaseVersion(v)
             if !isBeta { sawOnlyPrerelease = false }
-            guard !isBeta, systemSatisfies(it.minSystem) else { continue }
+            // 没勾「接收测试版」时才跳过 beta 条目；勾了就按原来的行为，beta 也算新版
+            if !allowBeta, isBeta { continue }
+            guard systemSatisfies(it.minSystem) else { continue }
             let latest = v
             let newer = Ver.isNewer(latest, than: current)
             var notes = plainNotes(it.notes)
@@ -580,7 +584,7 @@ enum Checker {
         }
         // 更新源里只有测试版（比如作者开了 beta 通道、正式版还没跟上）：
         // 本机装的就是最新正式版，安静地算「已是最新」，别报更新也别报失败。
-        if sawAnyVersioned && sawOnlyPrerelease {
+        if !allowBeta, sawAnyVersioned, sawOnlyPrerelease {
             return Outcome(status: .upToDate, latest: current, url: feed, homepage: siteFromFeed(feed),
                            note: "只跟正式版比：更新源里最新的是测试版（\(items.compactMap { $0.marketingVersion }.first ?? "beta")）")
         }
@@ -588,7 +592,7 @@ enum Checker {
     }
 
     static func appStore(bundleId: String, current: String, installedAt: Date?,
-                         country: String) async -> Outcome? {
+                         country: String, allowBeta: Bool) async -> Outcome? {
         let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=\(country)"
         guard let obj = await Net.json(url) as? [String: Any],
               let count = obj["resultCount"] as? Int, count > 0,
@@ -611,7 +615,7 @@ enum Checker {
                            releaseDate: release)
         }
 
-        if isPrereleaseVersion(latest) {
+        if !allowBeta, isPrereleaseVersion(latest) {
             return Outcome(status: .upToDate, latest: current, url: page, homepage: seller,
                            note: "只跟正式版比：商店里最新的是测试版（\(latest)）", releaseDate: release)
         }
@@ -628,14 +632,16 @@ enum Checker {
 
 struct VendorRule {
     let matches: (InstalledApp) -> Bool
-    let run: (InstalledApp) async -> Checker.Outcome?
+    /// 第二个参数是 allowBeta（用户勾了「接收测试版」才为 true）
+    let run: (InstalledApp, Bool) async -> Checker.Outcome?
 }
 
 enum Rules {
     /// 把一个「官方最新版本号」变成检测结果；本机反而更高时给个说明
-    static func verdict(_ app: InstalledApp, latest: String, url: String, releaseDate: Date? = nil) -> Checker.Outcome {
+    static func verdict(_ app: InstalledApp, latest: String, url: String, releaseDate: Date? = nil,
+                        allowBeta: Bool = false) -> Checker.Outcome {
         // 抓到的要是测试版（2.0.0-beta.3、1.2rc1 这种），就不算更新：只跟正式版比
-        if isPrereleaseVersion(latest) {
+        if !allowBeta, isPrereleaseVersion(latest) {
             return Checker.Outcome(status: .upToDate, latest: app.version, url: url, homepage: url,
                                    note: "只跟正式版比：更新源里最新的是测试版（\(latest)）",
                                    releaseDate: releaseDate)
@@ -652,7 +658,7 @@ enum Rules {
 
     /// 官网页面里抓版本号
     static func pageRegex(app: InstalledApp, page: String, pattern: String,
-                          downloadPage: String) async -> Checker.Outcome? {
+                          downloadPage: String, allowBeta: Bool) async -> Checker.Outcome? {
         guard let html = await Net.text(page) else { return nil }
         guard let re = try? NSRegularExpression(pattern: pattern) else { return nil }
         let ns = html as NSString
@@ -662,11 +668,12 @@ enum Rules {
             versions.append(ns.substring(with: m.range(at: 1)))
         }
         guard let latest = versions.max(by: { Ver.compare($0, $1) == .orderedAscending }) else { return nil }
-        return verdict(app, latest: latest, url: downloadPage)
+        return verdict(app, latest: latest, url: downloadPage, allowBeta: allowBeta)
     }
 
     /// GitHub Releases 最新 tag
-    static func githubRepo(app: InstalledApp, repo: String, downloadPage: String) async -> Checker.Outcome? {
+    static func githubRepo(app: InstalledApp, repo: String, downloadPage: String,
+                           allowBeta: Bool) async -> Checker.Outcome? {
         switch await Net.githubLatestRelease(repo) {
         case .failure(let err):
             if err.isRateLimited {
@@ -679,64 +686,69 @@ enum Rules {
         case .success(let obj):
             guard let obj, let tag = obj["tag_name"] as? String else { return nil }
             let latest = tag.hasPrefix("v") ? String(tag.dropFirst()) : tag
-            return verdict(app, latest: latest, url: downloadPage)
+            return verdict(app, latest: latest, url: downloadPage, allowBeta: allowBeta)
         }
     }
 
     static let all: [VendorRule] = [
         // 微信
-        VendorRule(matches: { $0.bundleId == "com.tencent.xinWeChat" }) { app in
+        VendorRule(matches: { $0.bundleId == "com.tencent.xinWeChat" }) { app, allowBeta in
             await pageRegex(app: app,
                             page: "https://mac.weixin.qq.com/",
                             pattern: #"WeChatMac_([0-9]+\.[0-9]+\.?[0-9]*)\.dmg"#,
-                            downloadPage: "https://mac.weixin.qq.com/")
+                            downloadPage: "https://mac.weixin.qq.com/",
+                            allowBeta: allowBeta)
         },
         // QQ
-        VendorRule(matches: { $0.bundleId == "com.tencent.QQ" || $0.bundleId == "com.tencent.qq" }) { app in
+        VendorRule(matches: { $0.bundleId == "com.tencent.QQ" || $0.bundleId == "com.tencent.qq" }) { app, allowBeta in
             await pageRegex(app: app,
                             page: "https://im.qq.com/macqq/index.shtml",
                             pattern: #"QQ_v([0-9]+\.[0-9]+\.[0-9]+)-[0-9]+\.dmg"#,
-                            downloadPage: "https://im.qq.com/macqq/")
+                            downloadPage: "https://im.qq.com/macqq/",
+                            allowBeta: allowBeta)
         },
         // Obsidian
-        VendorRule(matches: { $0.bundleId == "md.obsidian" }) { app in
+        VendorRule(matches: { $0.bundleId == "md.obsidian" }) { app, allowBeta in
             await githubRepo(app: app, repo: "obsidianmd/obsidian-releases",
-                             downloadPage: "https://obsidian.md/download")
+                             downloadPage: "https://obsidian.md/download", allowBeta: allowBeta)
         },
         // Google Chrome：官方 versionhistory 接口在国内不通，改用 Chrome for Testing 的 stable 版本
-        VendorRule(matches: { $0.bundleId == "com.google.Chrome" }) { app in
+        VendorRule(matches: { $0.bundleId == "com.google.Chrome" }) { app, allowBeta in
             guard let obj = await Net.json("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json") as? [String: Any],
                   let channels = obj["channels"] as? [String: Any],
                   let stable = channels["Stable"] as? [String: Any],
                   let latest = stable["version"] as? String else { return nil }
-            return verdict(app, latest: latest, url: "https://www.google.com/chrome/")
+            return verdict(app, latest: latest, url: "https://www.google.com/chrome/", allowBeta: allowBeta)
         },
         // WPS Office
-        VendorRule(matches: { $0.bundleId == "com.kingsoft.wpsoffice.mac" }) { app in
+        VendorRule(matches: { $0.bundleId == "com.kingsoft.wpsoffice.mac" }) { app, allowBeta in
             await pageRegex(app: app,
                             page: "https://www.wps.cn/product/wpsmac",
                             pattern: #"(1[0-9]\.[0-9]+\.[0-9]{4,6})"#,
-                            downloadPage: "https://www.wps.cn/product/wpsmac")
+                            downloadPage: "https://www.wps.cn/product/wpsmac",
+                            allowBeta: allowBeta)
         },
         // Motrix
-        VendorRule(matches: { $0.bundleId == "app.motrix.native" }) { app in
+        VendorRule(matches: { $0.bundleId == "app.motrix.native" }) { app, allowBeta in
             await githubRepo(app: app, repo: "agalwood/Motrix",
-                             downloadPage: "https://motrix.app/")
+                             downloadPage: "https://motrix.app/", allowBeta: allowBeta)
         },
         // Anki
-        VendorRule(matches: { $0.bundleId == "net.ankiweb.anki" }) { app in
+        VendorRule(matches: { $0.bundleId == "net.ankiweb.anki" }) { app, allowBeta in
             await githubRepo(app: app, repo: "ankitects/anki",
-                             downloadPage: "https://apps.ankiweb.net/")
+                             downloadPage: "https://apps.ankiweb.net/", allowBeta: allowBeta)
         },
         // 洛雪音乐
-        VendorRule(matches: { $0.bundleId == "cn.toside.music.desktop" }) { app in
+        VendorRule(matches: { $0.bundleId == "cn.toside.music.desktop" }) { app, allowBeta in
             await githubRepo(app: app, repo: "lyswhut/lx-music-desktop",
-                             downloadPage: "https://github.com/lyswhut/lx-music-desktop/releases")
+                             downloadPage: "https://github.com/lyswhut/lx-music-desktop/releases",
+                             allowBeta: allowBeta)
         },
         // UVR（Ultimate Vocal Remover）
-        VendorRule(matches: { $0.id == "UVR" || $0.bundleId == "UVR" }) { app in
+        VendorRule(matches: { $0.id == "UVR" || $0.bundleId == "UVR" }) { app, allowBeta in
             await githubRepo(app: app, repo: "Anjok07/ultimatevocalremovergui",
-                             downloadPage: "https://github.com/Anjok07/ultimatevocalremovergui/releases")
+                             downloadPage: "https://github.com/Anjok07/ultimatevocalremovergui/releases",
+                             allowBeta: allowBeta)
         }
     ]
 

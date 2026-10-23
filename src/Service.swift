@@ -60,7 +60,9 @@ final class UpdateService: ObservableObject {
 
     /// force = false（定时、启动）：结果还新鲜的 App 直接跳过，只补查过期的
     /// force = true（用户点「检查更新」或刷新按钮）：全部重查
-    func checkAll(force: Bool = false) {
+    /// - Parameter only: 只查这几个 bundle id（切换「接收测试版」时只重查会受影响的那几个，
+    ///   不用把 136 个 App 全跑一遍）
+    func checkAll(force: Bool = false, only: Set<String>? = nil) {
         guard !checking else { return }
         if apps.isEmpty { rescan() }
 
@@ -68,9 +70,11 @@ final class UpdateService: ObservableObject {
         let ttl = max(0.25, settings.intervalHours) * 3600
         let cutoff = Date().addingTimeInterval(-ttl)
 
+        let allowBeta = settings.receiveBetaEnabled
         let targets = apps
             .filter { !settings.ignored.contains($0.id) }
             .filter { app in
+                if let only { return only.contains(app.id) }
                 guard !force else { return true }
                 guard let r = results[app.id] else { return true }
                 return r.checkedAt < cutoff
@@ -92,7 +96,7 @@ final class UpdateService: ObservableObject {
 
                 // 先塞满并发槽位
                 while inFlight < Self.maxConcurrentChecks, let app = next.next() {
-                    group.addTask { await Checker.check(app) }
+                    group.addTask { await Checker.check(app, allowBeta: allowBeta) }
                     inFlight += 1
                 }
 
@@ -102,7 +106,7 @@ final class UpdateService: ObservableObject {
                     inFlight -= 1
                     // 回来一个就补一个，别等整批
                     if let app = next.next() {
-                        group.addTask { await Checker.check(app) }
+                        group.addTask { await Checker.check(app, allowBeta: allowBeta) }
                         inFlight += 1
                     }
                     self.progress = Double(done) / total
@@ -198,6 +202,32 @@ final class UpdateService: ObservableObject {
     func setNotify(_ on: Bool) {
         settings.notifyOnUpdates = on
         save()
+    }
+
+    /// 接收测试版：默认关。切换后只重查「结果会被这个开关影响」的 App，不跑全量。
+    func setReceiveBeta(_ on: Bool) {
+        settings.receiveBeta = on
+        save()
+
+        let affected = Set(rows.compactMap { row -> String? in
+            guard let r = row.result else { return nil }
+            if on {
+                // 打开：appcast 源的 App 都可能藏着 beta，全都重看一眼
+                if r.source == "sparkle" { return row.id }
+            } else {
+                // 关掉：现在正在提示测试版的那几条要立刻改判
+                if let l = r.latest, isPrereleaseVersion(l) { return row.id }
+            }
+            // 之前被过滤成「只有测试版」的，两种方向都要重查
+            if r.note?.hasPrefix("只跟正式版比") == true { return row.id }
+            return nil
+        })
+        if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
+            let line = "[UR] 接收测试版 → \(on ? "开" : "关")，受影响 \(affected.count) 个：\(affected.sorted().joined(separator: ", "))\n"
+            FileHandle.standardError.write(line.data(using: .utf8)!)
+        }
+        guard !affected.isEmpty else { return }
+        checkAll(force: true, only: affected)
     }
 
     // MARK: - 通知

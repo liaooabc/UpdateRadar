@@ -55,6 +55,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if env["UPDATERADAR_SHOW_MENU"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showStatusMenu() }
         }
+        // 调试用：UPDATERADAR_SET_BETA=0/1 起来 4 秒后按下/松开「接收测试版」开关，
+        // 用来看「切开关只重查受影响的 App」这条路径
+        if let v = env["UPDATERADAR_SET_BETA"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+                self?.service.setReceiveBeta(v == "1")
+            }
+        }
         if env["UPDATERADAR_SHOW_ON_LAUNCH"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showPanel() }
             if env["UPDATERADAR_AUTOCLOSE"] != nil {

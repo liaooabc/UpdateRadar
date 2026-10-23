@@ -61,8 +61,12 @@ struct AppSettings: Codable, Equatable {
     /// bundleId -> 用户手动确认为最新的那个商店版本号；商店再出新版本时会自动重新提醒
     var dismissed: [String: String]?
 
+    /// 接不接收测试版（beta / rc）更新。默认关：只跟正式版比，别拿 beta 打扰人。
+    var receiveBeta: Bool?
+
     var notifyEnabled: Bool { notifyOnUpdates ?? true }
     var countVisible: Bool { showCount ?? true }
+    var receiveBetaEnabled: Bool { receiveBeta ?? false }
 }
 
 struct Store: Codable {

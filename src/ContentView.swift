@@ -409,6 +409,11 @@ struct ContentView: View {
                     get: { service.settings.hideUnknown },
                     set: { service.setHideUnknown($0) }
                 ))
+                // 默认关：只跟正式版比，beta 不打扰。打开后重查一遍 appcast 源的 App。
+                Toggle("接收测试版更新", isOn: Binding(
+                    get: { service.settings.receiveBetaEnabled },
+                    set: { service.setReceiveBeta($0) }
+                ))
                 Divider()
                 Button("打开数据文件夹") {
                     NSWorkspace.shared.open(UpdateService.supportDir)
