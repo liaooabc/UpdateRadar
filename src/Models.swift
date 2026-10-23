@@ -103,6 +103,10 @@ struct AppRow: Identifiable {
             if let n = result?.note, n.hasPrefix("手动确认") {
                 return "\(app.version)　已确认最新（商店 \(latest ?? "?"))"
             }
+            // 更新源里只有测试版时不提示更新，但得让用户知道为什么（不然会以为漏了）
+            if result?.note?.hasPrefix("只跟正式版比") == true {
+                return "\(app.version)　·　只有测试版更新"
+            }
             return app.version
         case .failed:
             // 状态字在右边那列（⚠ 检测失败），副标题不重复状态字；

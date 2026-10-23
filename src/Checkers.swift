@@ -13,6 +13,21 @@ private func looksLikeVersion(_ s: String) -> Bool {
     return t.contains(where: { $0.isNumber })
 }
 
+/// 这个版本号是不是测试版：Beta / Alpha / RC / Preview / nightly …
+/// 用途只有一个 —— 别拿测试版去提示更新（用户只要正式版，见 1.0.6 的需求）。
+func isPrereleaseVersion(_ raw: String) -> Bool {
+    let lower = raw.lowercased()
+    // 按「非字母数字」切词，避免 Marc / snapshot 这类词里凑出来的字母组合误判
+    let words: Set<String> = ["beta", "alpha", "rc", "pre", "preview", "prerelease",
+                              "nightly", "snapshot", "canary", "unstable", "test", "dev"]
+    let tokens = lower.split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+    if tokens.contains(where: { words.contains($0) }) { return true }
+    // 连写的：2.0.0-beta2 / 1.2.3rc1 / 3.0alpha
+    let pattern = "(^|[^a-z])(alpha|beta|rc|dev|pre|preview|prerelease|nightly|snapshot|canary)[0-9]*([^a-z]|$)"
+    if lower.range(of: pattern, options: .regularExpression) != nil { return true }
+    return false
+}
+
 // MARK: - Sparkle appcast
 
 final class AppcastParser: NSObject, XMLParserDelegate {
@@ -26,6 +41,8 @@ final class AppcastParser: NSObject, XMLParserDelegate {
         var pubDate: String?
         var notes: String?
         var notesLink: String?
+        /// <sparkle:channel>beta</sparkle:channel>：只有订阅了该通道的客户端才该收这条
+        var channel: String?
 
         /// 对外展示、用来比较的版本号。营销版本号优先，其次 title（老式 appcast 把版本写在 title 里），
         /// 最后才是构建号——构建号跟 CFBundleShortVersionString 不是一套编号，不能混比。
@@ -100,6 +117,8 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             if current?.notes == nil, !text.isEmpty { current?.notes = text }
         case "sparkle:releasenoteslink":
             if !text.isEmpty { current?.notesLink = text }
+        case "sparkle:channel":
+            if !text.isEmpty { current?.channel = text }
         case "item":
             if let c = current { items.append(c) }
             current = nil
@@ -424,6 +443,13 @@ enum Cask {
     }
 
     static func verdict(_ app: InstalledApp, entry: Entry) -> Checker.Outcome {
+        // 版本库里记的是测试版时不提示（有些 cask 会跟到 beta 上）
+        if isPrereleaseVersion(entry.version) {
+            return Checker.Outcome(status: .upToDate, latest: app.version,
+                                   url: entry.homepage ?? "https://formulae.brew.sh/cask/\(entry.token)",
+                                   homepage: entry.homepage,
+                                   note: "只跟正式版比：版本库里现在记的是测试版（\(entry.version)）")
+        }
         if isBuildOnlyBump(entry.version, over: app.version) {
             return Checker.Outcome(status: .upToDate, latest: entry.version, url: entry.homepage, note: nil)
         }
@@ -525,9 +551,18 @@ enum Checker {
         let items = AppcastParser().parse(Data(body.utf8))
         guard !items.isEmpty else { return nil }
 
-        // appcast 里条目按新到旧排列，取第一条「本机系统能装」且带可用版本号的
+        // appcast 里条目按新到旧排列，取第一条「正式版 + 本机系统能装」的。
+        // 带 <sparkle:channel> 的（beta 通道）和版本号里带 Beta/RC 的一律跳过：
+        // 用户只要稳定版，别拿 beta 去提示「有新版本」。
+        var sawAnyVersioned = false
+        var sawOnlyPrerelease = true
         for it in items {
-            guard systemSatisfies(it.minSystem), let latest = it.marketingVersion else { continue }
+            guard let v = it.marketingVersion else { continue }
+            sawAnyVersioned = true
+            let isBeta = (it.channel?.isEmpty == false) || isPrereleaseVersion(v)
+            if !isBeta { sawOnlyPrerelease = false }
+            guard !isBeta, systemSatisfies(it.minSystem) else { continue }
+            let latest = v
             let newer = Ver.isNewer(latest, than: current)
             var notes = plainNotes(it.notes)
             if notes == nil, newer, let link = it.notesLink, let html = await Net.text(link) {
@@ -542,6 +577,12 @@ enum Checker {
                            note: nil,
                            releaseDate: parseRFC822(it.pubDate),
                            notes: notes)
+        }
+        // 更新源里只有测试版（比如作者开了 beta 通道、正式版还没跟上）：
+        // 本机装的就是最新正式版，安静地算「已是最新」，别报更新也别报失败。
+        if sawAnyVersioned && sawOnlyPrerelease {
+            return Outcome(status: .upToDate, latest: current, url: feed, homepage: siteFromFeed(feed),
+                           note: "只跟正式版比：更新源里最新的是测试版（\(items.compactMap { $0.marketingVersion }.first ?? "beta")）")
         }
         return nil
     }
@@ -570,6 +611,10 @@ enum Checker {
                            releaseDate: release)
         }
 
+        if isPrereleaseVersion(latest) {
+            return Outcome(status: .upToDate, latest: current, url: page, homepage: seller,
+                           note: "只跟正式版比：商店里最新的是测试版（\(latest)）", releaseDate: release)
+        }
         let isNewer = Ver.isNewer(latest, than: current)
         // 同上：不是新版本也留着更新说明，点开能看
         return Outcome(status: isNewer ? .updateAvailable : .upToDate,
@@ -589,6 +634,12 @@ struct VendorRule {
 enum Rules {
     /// 把一个「官方最新版本号」变成检测结果；本机反而更高时给个说明
     static func verdict(_ app: InstalledApp, latest: String, url: String, releaseDate: Date? = nil) -> Checker.Outcome {
+        // 抓到的要是测试版（2.0.0-beta.3、1.2rc1 这种），就不算更新：只跟正式版比
+        if isPrereleaseVersion(latest) {
+            return Checker.Outcome(status: .upToDate, latest: app.version, url: url, homepage: url,
+                                   note: "只跟正式版比：更新源里最新的是测试版（\(latest)）",
+                                   releaseDate: releaseDate)
+        }
         let newer = Ver.isNewer(latest, than: app.version)
         // 只有「本机反而更高」时才需要解释，版本相同或更新都保持沉默
         let note: String? = (!newer && Ver.isNewer(app.version, than: latest))
