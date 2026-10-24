@@ -195,18 +195,14 @@ struct ContentView: View {
 
     private var tabBar: some View {
         HStack(spacing: 8) {
-            // 照 Apple 分段控件（照片 App 那个 日/周/月/年）做的：外面一条浅灰胶囊轨道，
-            // 选中的那一段是稍深一点的胶囊 + 一点投影，切换时滑过去。
+            // 轨道是真的液态玻璃（系统 glassEffect），选中的那一段只是一层淡淡的中性胶囊：
+            // 不用系统蓝，才对得上照片 App 那个 日/周/月/年。
             HStack(spacing: 2) {
                 segButton("可更新 \(service.updateCount)", index: 0)
                 segButton("其他 \(service.rows.filter { !$0.isUpdate }.count)", index: 1)
             }
             .padding(3)
-            .background(
-                Capsule()
-                    .fill(Color.primary.opacity(0.055))
-                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.8))
-            )
+            .modifier(GlassTrack())
 
             Spacer(minLength: 0)
 
@@ -220,21 +216,14 @@ struct ContentView: View {
                         .font(.system(size: 11))
                         .frame(width: 78)
                 }
-                .padding(.horizontal, 8)
+                .padding(.horizontal, 10)
                 .padding(.vertical, 4)
-                .background(
-                    Capsule()
-                        .fill(Color.primary.opacity(0.055))
-                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.8))
-                )
+                .modifier(GlassSearchField())
             }
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
     }
-
-    /// 分段控件的滑块：用同一个 namespace，切换时会在两段之间滑过去
-    @Namespace private var segNS
 
     private func segButton(_ label: String, index: Int) -> some View {
         let selected = ui.tab == index
@@ -249,10 +238,8 @@ struct ContentView: View {
                 .background {
                     if selected {
                         Capsule()
-                            .fill(Color.primary.opacity(0.13))
-                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05), lineWidth: 0.5))
-                            .shadow(color: Color.black.opacity(0.07), radius: 1, y: 0.5)
-                            .matchedGeometryEffect(id: "seg-pill", in: segNS)
+                            .fill(Color.primary.opacity(0.10))
+                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5))
                     }
                 }
                 .contentShape(Capsule())
@@ -458,6 +445,35 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+}
+
+// MARK: - 玻璃
+
+/// 真·液态玻璃：macOS 26 起系统提供 `.glassEffect`，材质、折射、边缘高光全由系统画。
+/// 自己叠 material + 描边 + 投影只能做出"磨砂塑料"，这就是前面那版不像的原因。
+/// 老系统（15 及以下）退回一个朴素的浅灰胶囊。
+private struct GlassTrack: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular, in: .capsule)
+        } else {
+            content
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+}
+
+private struct GlassSearchField: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .capsule)
+        } else {
+            content
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
     }
 }
 
