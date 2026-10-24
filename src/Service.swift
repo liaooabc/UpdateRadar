@@ -96,7 +96,8 @@ final class UpdateService: ObservableObject {
 
                 // 先塞满并发槽位
                 while inFlight < Self.maxConcurrentChecks, let app = next.next() {
-                    group.addTask { await Checker.check(app, allowBeta: allowBeta) }
+                    let prev = self.results[app.id]     // 官网安装包指纹要比上一轮的结果
+                    group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta) }
                     inFlight += 1
                 }
 
@@ -106,7 +107,8 @@ final class UpdateService: ObservableObject {
                     inFlight -= 1
                     // 回来一个就补一个，别等整批
                     if let app = next.next() {
-                        group.addTask { await Checker.check(app, allowBeta: allowBeta) }
+                        let prev = self.results[app.id]
+                        group.addTask { await Checker.check(app, previous: prev, allowBeta: allowBeta) }
                         inFlight += 1
                     }
                     self.progress = Double(done) / total
@@ -139,9 +141,12 @@ final class UpdateService: ObservableObject {
     private func rebuild() {
         rows = apps.map { app in
             var result = results[app.id]
-            if let r = result, let confirmed = settings.dismissed?[app.id], confirmed == (r.latest ?? "") {
+            if let r = result, let confirmed = settings.dismissed?[app.id],
+               confirmed == (r.latest ?? r.marker ?? "") {
                 result?.status = .upToDate
-                result?.note = "手动确认：商店版本 \(r.latest ?? "-")，本机包标注 \(app.version)，App Store 也认为已最新"
+                result?.note = r.latest == nil
+                    ? "手动确认：官网这个安装包已经是最新的，下次换包再提醒"
+                    : "手动确认：商店版本 \(r.latest ?? "-")，本机包标注 \(app.version)，App Store 也认为已最新"
             }
             return AppRow(app: app, result: result)
         }
@@ -178,7 +183,8 @@ final class UpdateService: ObservableObject {
     /// 用户说「这个已经是最新」：记下当时的商店版本号，商店再涨版本会自动恢复提醒
     func dismiss(_ row: AppRow) {
         var map = settings.dismissed ?? [:]
-        map[row.id] = row.latest ?? ""
+        // 没有版本号的（官网只给安装包）：拿安装包指纹当钥匙，官网换包了还会提醒
+        map[row.id] = row.latest ?? row.result?.marker ?? ""
         settings.dismissed = map
         rebuild()
         save()

@@ -230,6 +230,31 @@ enum Net {
         return "https://cdn.jsdelivr.net/gh/\(owner)/\(repo)@\(branch)/\(rest)"
     }
 
+    /// 抓 302 的落地地址（官网「下载」短链 → 真实安装包地址）。
+    /// 刻意不跟下去：安装包几百兆，只要那串地址。ugapk 这类短链不支持 HEAD，
+    /// 所以用 GET + 在重定向处掐断，一个字节的包都不下。
+    private final class RedirectProbe: NSObject, URLSessionTaskDelegate {
+        var target: URL?
+        func urlSession(_ s: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            target = request.url
+            completionHandler(nil)
+        }
+    }
+
+    static func redirectTarget(_ urlString: String) async -> URL? {
+        guard let url = URL(string: urlString) else { return nil }
+        let probe = RedirectProbe()
+        let s = URLSession(configuration: session.configuration, delegate: probe, delegateQueue: nil)
+        defer { s.finishTasksAndInvalidate() }
+        var req = URLRequest(url: url)
+        req.timeoutInterval = 8
+        _ = try? await s.data(for: req)      // 重定向被掐断会抛错，正常
+        return probe.target
+    }
+
     private static func fetchText(_ urlString: String) async -> String? {
         guard let url = URL(string: urlString) else { return nil }
         do {
@@ -475,8 +500,11 @@ enum Cask {
 // MARK: - 检测器
 
 enum Checker {
+    /// - Parameter previous: 上一轮的检测结果。官网只放安装包、不写版本号的 App
+    ///   （扣子桌面端这种）要靠它比「官网的包是不是换了」
     /// - Parameter allowBeta: 用户打开了「接收测试版」时才为 true；默认只跟正式版比
-    static func check(_ app: InstalledApp, allowBeta: Bool = false) async -> CheckResult {
+    static func check(_ app: InstalledApp, previous: CheckResult? = nil,
+                      allowBeta: Bool = false) async -> CheckResult {
         let bid = app.id
         let now = Date()
 
@@ -487,11 +515,12 @@ enum Checker {
 
         // 1. 厂商专用规则优先（微信这类没有 appcast 的常用软件）
         if let rule = Rules.match(app) {
-            if let r = await rule.run(app, allowBeta) {
+            if let r = await rule.run(app, previous, allowBeta) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
                                    downloadURL: r.url, homepage: r.homepage ?? r.url, note: r.note,
                                    source: "vendor",
-                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
+                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes,
+                                   marker: r.marker)
             }
             // 规则命中但这次没抓到：说明是网络/页面变动问题，不是“没有检测源”
             return failed("官网页面没抓到版本号")
@@ -554,6 +583,8 @@ enum Checker {
         var note: String?
         var releaseDate: Date?
         var notes: String?
+        /// 官网安装包指纹（只给安装包、不给版本号的 App 用）
+        var marker: String? = nil
     }
 
     static func sparkle(feed: String, current: String, build: String?, allowBeta: Bool) async -> Outcome? {
@@ -655,8 +686,9 @@ enum Checker {
 
 struct VendorRule {
     let matches: (InstalledApp) -> Bool
-    /// 第二个参数是 allowBeta（用户勾了「接收测试版」才为 true）
-    let run: (InstalledApp, Bool) async -> Checker.Outcome?
+    /// 第二个参数是上一轮的检测结果（官网只给安装包的那些要比指纹，别的一律忽略），
+    /// 第三个是 allowBeta（用户勾了「接收测试版」才为 true）
+    let run: (InstalledApp, CheckResult?, Bool) async -> Checker.Outcome?
 }
 
 enum Rules {
@@ -718,9 +750,84 @@ enum Rules {
         }
     }
 
+    /// 官网只给安装包、不给版本号的 App（扣子桌面端就是）：拿不到「最新版本是几」，
+    /// 那就记下官网当前那个安装包（文件名里的构建时间戳），下次换了包再提醒。
+    ///
+    /// 第一次只记录、不提示 —— 不然装完第一次检查就报「有新版本」，纯吓人。
+    /// 用户要是自己已经把 App 更新过了（.app 的创建时间晚于上次检查），也当成已装上。
+    static func officialPackage(app: InstalledApp, previous: CheckResult?,
+                                shortLink: String, downloadPage: String,
+                                name: String) async -> Checker.Outcome? {
+        guard let final = await Net.redirectTarget(shortLink) else { return nil }
+        let file = final.lastPathComponent
+        guard file.lowercased().hasSuffix(".dmg") else { return nil }
+        let url = final.absoluteString
+        // 只认构建号（v1792397273）：同一个构建换个渠道包（macOS / Intel / mac64）不算新版本，
+        // 否则短链哪天换条渠道就会被判成「有新安装包」。
+        let marker = packageMarker(file)
+        let stamp = packageStamp(marker)
+
+        guard let prev = previous?.marker else {
+            return Checker.Outcome(status: .upToDate, latest: nil, url: url, homepage: downloadPage,
+                                   note: "已记下官网当前的安装包（\(stamp)）；官网换包了会提醒你",
+                                   marker: marker)
+        }
+        if prev == marker {
+            return Checker.Outcome(status: .upToDate, latest: nil, url: url, homepage: downloadPage,
+                                   marker: marker)
+        }
+        if let lastCheck = previous?.checkedAt, let installed = app.installedAt, installed > lastCheck {
+            return Checker.Outcome(status: .upToDate, latest: nil, url: url, homepage: downloadPage,
+                                   note: "官网有新的安装包（\(stamp)），本机已经更新过了",
+                                   marker: marker)
+        }
+        return Checker.Outcome(status: .updateAvailable, latest: nil, url: url, homepage: downloadPage,
+                               note: "\(name) 官网不写版本号，按安装包变化提醒：官网已经有 \(stamp) 的新包",
+                               marker: marker)
+    }
+
+    /// 安装包文件名里的构建号：coze_space_docs_macos_v1792397273_c36e_1792399987.dmg → v1792397273
+    private static func packageMarker(_ file: String) -> String {
+        if let re = try? NSRegularExpression(pattern: #"_v(\d{8,})_"#),
+           let m = re.firstMatch(in: file, range: NSRange(file.startIndex..., in: file)),
+           let r = Range(m.range(at: 1), in: file) {
+            return "v" + file[r]
+        }
+        return file
+    }
+
+    /// 构建号本身就是打包时间戳（1792397273 → 10月19日的包），拿它说人话
+    private static func packageStamp(_ marker: String) -> String {
+        guard let re = try? NSRegularExpression(pattern: #"(\d{10})"#),
+              let m = re.firstMatch(in: marker, range: NSRange(marker.startIndex..., in: marker)),
+              let r = Range(m.range(at: 1), in: marker),
+              let ts = TimeInterval(marker[r]) else { return "新" }
+        let f = DateFormatter()
+        f.dateFormat = "M月d日"
+        return f.string(from: Date(timeIntervalSince1970: ts)) + "的包"
+    }
+
     static let all: [VendorRule] = [
+        // 扣子桌面端：官网「下载桌面端」是短链，落地到 CDN 的 dmg，文件名里只有构建时间戳、
+        // 没有 1.1.x 这种版本号；它自己的更新源（electron-updater）在字节内网域名上，
+        // 公网连不上。所以走「官网安装包指纹」这条路。
+        VendorRule(matches: { $0.bundleId == "cn.coze.desktop" }) { app, previous, _ in
+            await officialPackage(app: app, previous: previous,
+                                  shortLink: "https://ugapk.com/FJvCs",
+                                  downloadPage: "https://www.coze.cn/",
+                                  name: "扣子")
+        },
+        // 酷家乐：官网下载页里直接挂着 dmg（Kujiale-12.3.13-stable.dmg），版本号在文件名里。
+        // 注意这个页面更新很慢（2026-10 还挂着 2023-11 的 12.3.13），所以本机更高是正常的。
+        VendorRule(matches: { $0.bundleId == "com.kujiale.mac.kujiale" }) { app, _, allowBeta in
+            await pageRegex(app: app,
+                            page: "https://www.kujiale.com/activity/136",
+                            pattern: #"Kujiale-([0-9]+\.[0-9]+\.[0-9]+)-stable\.dmg"#,
+                            downloadPage: "https://www.kujiale.com/activity/136",
+                            allowBeta: allowBeta)
+        },
         // 微信
-        VendorRule(matches: { $0.bundleId == "com.tencent.xinWeChat" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "com.tencent.xinWeChat" }) { app, _, allowBeta in
             await pageRegex(app: app,
                             page: "https://mac.weixin.qq.com/",
                             pattern: #"WeChatMac_([0-9]+\.[0-9]+\.?[0-9]*)\.dmg"#,
@@ -728,7 +835,7 @@ enum Rules {
                             allowBeta: allowBeta)
         },
         // QQ
-        VendorRule(matches: { $0.bundleId == "com.tencent.QQ" || $0.bundleId == "com.tencent.qq" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "com.tencent.QQ" || $0.bundleId == "com.tencent.qq" }) { app, _, allowBeta in
             await pageRegex(app: app,
                             page: "https://im.qq.com/macqq/index.shtml",
                             pattern: #"QQ_v([0-9]+\.[0-9]+\.[0-9]+)-[0-9]+\.dmg"#,
@@ -736,12 +843,12 @@ enum Rules {
                             allowBeta: allowBeta)
         },
         // Obsidian
-        VendorRule(matches: { $0.bundleId == "md.obsidian" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "md.obsidian" }) { app, _, allowBeta in
             await githubRepo(app: app, repo: "obsidianmd/obsidian-releases",
                              downloadPage: "https://obsidian.md/download", allowBeta: allowBeta)
         },
         // Google Chrome：官方 versionhistory 接口在国内不通，改用 Chrome for Testing 的 stable 版本
-        VendorRule(matches: { $0.bundleId == "com.google.Chrome" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "com.google.Chrome" }) { app, _, allowBeta in
             guard let obj = await Net.json("https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions.json") as? [String: Any],
                   let channels = obj["channels"] as? [String: Any],
                   let stable = channels["Stable"] as? [String: Any],
@@ -749,7 +856,7 @@ enum Rules {
             return verdict(app, latest: latest, url: "https://www.google.com/chrome/", allowBeta: allowBeta)
         },
         // WPS Office
-        VendorRule(matches: { $0.bundleId == "com.kingsoft.wpsoffice.mac" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "com.kingsoft.wpsoffice.mac" }) { app, _, allowBeta in
             await pageRegex(app: app,
                             page: "https://www.wps.cn/product/wpsmac",
                             pattern: #"(1[0-9]\.[0-9]+\.[0-9]{4,6})"#,
@@ -757,23 +864,23 @@ enum Rules {
                             allowBeta: allowBeta)
         },
         // Motrix
-        VendorRule(matches: { $0.bundleId == "app.motrix.native" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "app.motrix.native" }) { app, _, allowBeta in
             await githubRepo(app: app, repo: "agalwood/Motrix",
                              downloadPage: "https://motrix.app/", allowBeta: allowBeta)
         },
         // Anki
-        VendorRule(matches: { $0.bundleId == "net.ankiweb.anki" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "net.ankiweb.anki" }) { app, _, allowBeta in
             await githubRepo(app: app, repo: "ankitects/anki",
                              downloadPage: "https://apps.ankiweb.net/", allowBeta: allowBeta)
         },
         // 洛雪音乐
-        VendorRule(matches: { $0.bundleId == "cn.toside.music.desktop" }) { app, allowBeta in
+        VendorRule(matches: { $0.bundleId == "cn.toside.music.desktop" }) { app, _, allowBeta in
             await githubRepo(app: app, repo: "lyswhut/lx-music-desktop",
                              downloadPage: "https://github.com/lyswhut/lx-music-desktop/releases",
                              allowBeta: allowBeta)
         },
         // UVR（Ultimate Vocal Remover）
-        VendorRule(matches: { $0.id == "UVR" || $0.bundleId == "UVR" }) { app, allowBeta in
+        VendorRule(matches: { $0.id == "UVR" || $0.bundleId == "UVR" }) { app, _, allowBeta in
             await githubRepo(app: app, repo: "Anjok07/ultimatevocalremovergui",
                              downloadPage: "https://github.com/Anjok07/ultimatevocalremovergui/releases",
                              allowBeta: allowBeta)

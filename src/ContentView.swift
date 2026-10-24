@@ -230,31 +230,51 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
+        // 只让这一条的胶囊和搜索框做过渡，列表不参与
+        .animation(.easeInOut(duration: 0.18), value: ui.tab)
     }
 
     private func segButton(_ label: String, index: Int) -> some View {
         let selected = ui.tab == index
         return Button {
-            withAnimation(.easeInOut(duration: 0.18)) { ui.tab = index }
+            // 切页签一定不能包在 withAnimation 里：整个列表会跟着换内容，
+            // 一动画就成了「旧行淡出、新行滑动入场」，看起来就是列表在抖。
+            // 动画只留给 tabBar 自己（见 tabBar 的 .animation）。
+            ui.tab = index
         } label: {
-            Text(label)
-                .font(.system(size: 11.5, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? Color.primary : Color.secondary)
-                .padding(.horizontal, 10)
-                .frame(height: Self.barControlHeight - 6)   // 轨道上下各留 3pt
-                .background {
-                    if selected {
-                        Capsule()
-                            .fill(Color.primary.opacity(0.10))
-                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5))
-                    }
+            // 透明的那份半粗文本只是占位：选中要变粗，字一变粗字宽就变，
+            // 玻璃轨道跟着一两个点地伸缩，切页签时看着就「晃」。锁住宽度最省事。
+            ZStack {
+                Text(label)
+                    .font(.system(size: 11.5, weight: .semibold))
+                    .opacity(0)
+                Text(label)
+                    .font(.system(size: 11.5, weight: selected ? .semibold : .regular))
+                    .foregroundStyle(selected ? Color.primary : Color.secondary)
+            }
+            .padding(.horizontal, 10)
+            .frame(height: Self.barControlHeight - 6)   // 轨道上下各留 3pt
+            .background {
+                if selected {
+                    Capsule()
+                        .fill(Color.primary.opacity(0.10))
+                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5))
                 }
-                .contentShape(Capsule())
+            }
+            .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
 
     // MARK: - 列表
+
+    /// 归顶要**不带**动画：带 0.18s 动画的归顶会让整列行从旧位置滑到顶部，
+    /// 用户看到的就是一次抖动。这里把动画显式关掉。
+    private func scrollTop(_ proxy: ScrollViewProxy) {
+        var tx = Transaction()
+        tx.disablesAnimations = true
+        withTransaction(tx) { proxy.scrollTo("top", anchor: .top) }
+    }
 
     private var list: some View {
         Group {
@@ -265,6 +285,8 @@ struct ContentView: View {
                 GeometryReader { geo in
                 let viewHeight = geo.size.height
                 ScrollViewReader { proxy in
+                    // .id(ui.tab)：两个页签各用各的滚动视图。否则共用一个时，
+                    // 切过去会带着上一个页签的滚动位置，再被 scrollTo 拽回顶部，中间就跳一下。
                     ScrollView {
                         LazyVStack(spacing: 0) {
                             Color.clear.frame(height: 0).id("top")
@@ -289,13 +311,11 @@ struct ContentView: View {
                         }
                         .padding(.vertical, 4)
                     }
+                    .id(ui.tab)
                     .defaultScrollAnchor(.top)
                     .onChange(of: visibleRows.count) {
                         // 正在读某一行展开的说明时，别因为后台查完了就把列表甩回顶部
-                        if ui.expanded.isEmpty { proxy.scrollTo("top", anchor: .top) }
-                    }
-                    .onChange(of: ui.tab) {
-                        proxy.scrollTo("top", anchor: .top)
+                        if ui.expanded.isEmpty { scrollTop(proxy) }
                     }
                     .onPreferenceChange(RowFrameKey.self) { ui.rowFrames = $0 }
                     // 点开一行时，只有说明会长到面板外面才滚一下；本来整行就在视野里就不动，

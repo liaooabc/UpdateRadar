@@ -1,11 +1,30 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
   <defs>
-    <linearGradient id="ringG" x1="0" y1="0" x2="0.85" y2="1">
-      <stop offset="0" stop-color="#3A4046"/>
-      <stop offset="0.5" stop-color="#3A4046"/>
-      <stop offset="1" stop-color="#15181B"/>
+    <linearGradient id="wall" x1="0.1" y1="0" x2="0.85" y2="1">
+      <stop offset="0" stop-color="#5A626A"/>
+      <stop offset="0.45" stop-color="#343A40"/>
+      <stop offset="1" stop-color="#14171A"/>
+    </linearGradient>
+    <linearGradient id="top" x1="0.08" y1="0.02" x2="0.9" y2="1">
+      <stop offset="0" stop-color="#E4E9ED"/>
+      <stop offset="0.28" stop-color="#B6BEC5"/>
+      <stop offset="0.62" stop-color="#7C848C"/>
+      <stop offset="0.88" stop-color="#4A5158"/>
+      <stop offset="1" stop-color="#333940"/>
+    </linearGradient>
+    <linearGradient id="seam" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#000000" stop-opacity="0.66"/>
+      <stop offset="0.5" stop-color="#000000" stop-opacity="0.18"/>
+      <stop offset="1" stop-color="#000000" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="edge" x1="0.05" y1="0.05" x2="0.75" y2="0.95">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.14"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
     </linearGradient>
   </defs>
-  <circle cx="512.0" cy="512.0" r="354.0" fill="none"
-          stroke="url(#ringG)" stroke-width="132.0"/>
+  <circle cx="512" cy="512" r="336" fill="none" stroke="url(#wall)" stroke-width="96"/>
+  <circle cx="512" cy="512" r="304" fill="none" stroke="url(#top)" stroke-width="32"/>
+  <circle cx="512" cy="512" r="297" fill="none" stroke="url(#seam)" stroke-width="26"/>
+  <circle cx="512" cy="512" r="380" fill="none" stroke="url(#edge)" stroke-width="9"/>
 </svg>

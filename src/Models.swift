@@ -47,6 +47,9 @@ struct CheckResult: Identifiable, Codable, Equatable {
     var checkedAt: Date
     var releaseDate: Date?  // 新版本的发布/更新时间，用来证明"哪个更新"
     var notes: String?      // 更新详情（从更新源里抓的第一段）
+    /// 官网安装包指纹（文件名的构建时间戳）。官网只放安装包、不写版本号的 App
+    /// （扣子桌面端）用它判断「官网的包换了没」，因为压根没有版本号可比。
+    var marker: String? = nil
 
     var id: String { bundleId }
 }
@@ -99,7 +102,9 @@ struct AppRow: Identifiable {
     var subtitle: String {
         switch status {
         case .updateAvailable:
-            let base = "\(app.version)  →  \(latest ?? "?" )"
+            // 官网只放安装包、没有版本号的那种：只能告诉你「官网换包了」
+            guard let latest else { return "\(app.version)　·　官网有新安装包" }
+            let base = "\(app.version)  →  \(latest)"
             if let d = result?.releaseDate {
                 let f = DateFormatter()
                 f.dateFormat = "M月d日"
@@ -113,6 +118,11 @@ struct AppRow: Identifiable {
             // 更新源里只有测试版时不提示更新，但得让用户知道为什么（不然会以为漏了）
             if result?.note?.hasPrefix("只跟正式版比") == true {
                 return "\(app.version)　·　只有测试版更新"
+            }
+            // 官网页面比本机旧（酷家乐那种页面常年不更新）：把官网看到的写出来，
+            // 免得用户以为「加了官网源怎么还是老样子」
+            if result?.note?.hasPrefix("官方源当前是") == true, let latest {
+                return "\(app.version)　·　官网页面还是 \(latest)"
             }
             return app.version
         case .failed:
