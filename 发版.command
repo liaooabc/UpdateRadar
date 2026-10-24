@@ -22,7 +22,7 @@ if ! ./package.sh >"$LOG" 2>&1; then
     echo "--------"
     grep -i "error" "$LOG" | head -5 || tail -20 "$LOG"
     echo "--------"
-    echo "（完整日志在 $LOG）"
+    echo "（完整日志在 ${LOG}）"
     read -n 1 -s -r -p "按任意键关闭"
     exit 1
 fi

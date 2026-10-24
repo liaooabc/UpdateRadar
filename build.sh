@@ -83,7 +83,7 @@ if [ -f "$ICON_DOC/icon.json" ]; then
         # 自查：白天 / 暗夜两套图层的 LayerOpacity 必须正好互换，否则等于没做明暗
         LAYERS=$(xcrun assetutil --info "$APP/Contents/Resources/Assets.car" 2>/dev/null \
                  | grep -c '"AssetType" : "Vector"' || true)
-        echo "  .icon 已编译 → Assets.car（矢量图层条目：$LAYERS，含 Aqua / DarkAqua / Tinted 三套）"
+        echo "  .icon 已编译 → Assets.car（矢量图层条目：${LAYERS}，含 Aqua / DarkAqua / Tinted 三套）"
     else
         sed -n '1,8p' "$BUILD/actool.log"
         fallback_icns

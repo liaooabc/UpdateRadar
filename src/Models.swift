@@ -16,6 +16,9 @@ struct InstalledApp: Identifiable, Hashable {
     let path: String
     let bundleId: String?
     let version: String
+    /// CFBundleVersion。更新源经常写构建号而不是营销版本号（Office: 16.114.26102031），
+    /// 少了它就会把「本机已经装着的包」判成新版本。
+    let build: String
     let sparkleFeed: String?
     let isAppStore: Bool
     let isBeta: Bool

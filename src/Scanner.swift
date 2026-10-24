@@ -60,6 +60,9 @@ enum Scanner {
         let version = (dict["CFBundleShortVersionString"] as? String)
             ?? (dict["CFBundleVersion"] as? String)
             ?? "0"
+        // 构建号单独留着：Office 这类更新源记的是 build（16.114.26102031），
+        // 营销版本号是 16.114.1，只比前者必然误报「有新版本」。
+        let build = (dict["CFBundleVersion"] as? String) ?? ""
 
         var feed = dict["SUFeedURL"] as? String
         if let f = feed {
@@ -83,6 +86,7 @@ enum Scanner {
             path: path,
             bundleId: bundleId,
             version: version,
+            build: build,
             sparkleFeed: feed,
             isAppStore: isMAS,
             isBeta: isBeta,

@@ -450,6 +450,13 @@ enum Cask {
                                    homepage: entry.homepage,
                                    note: "只跟正式版比：版本库里现在记的是测试版（\(entry.version)）")
         }
+        // 版本库里记的是构建号（Office 的 cask version 就是 16.114.26102031）：
+        // 本机装的就是这个包，别报更新。
+        if latestIsInstalledBuild(entry.version, current: app.version, build: app.build) {
+            return Checker.Outcome(status: .upToDate, latest: entry.version,
+                                   url: entry.homepage ?? "https://formulae.brew.sh/cask/\(entry.token)",
+                                   homepage: entry.homepage, note: nil)
+        }
         if isBuildOnlyBump(entry.version, over: app.version) {
             return Checker.Outcome(status: .upToDate, latest: entry.version, url: entry.homepage, note: nil)
         }
@@ -492,7 +499,8 @@ enum Checker {
 
         // 2. Sparkle appcast：34 个 App 走这条路
         if let feed = app.sparkleFeed {
-            if let r = await sparkle(feed: feed, current: app.version, allowBeta: allowBeta) {
+            if let r = await sparkle(feed: feed, current: app.version, build: app.build,
+                                     allowBeta: allowBeta) {
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
                                    downloadURL: r.url,
                                    homepage: r.homepage ?? siteFromFeed(feed),
@@ -511,7 +519,7 @@ enum Checker {
         // 会被误判成「不在商店」。所以国区查不到时再试一次美区，只在没命中时才多发请求。
         if let bidReal = app.bundleId, app.isAppStore {
             for country in ["cn", "us"] {
-                if let r = await appStore(bundleId: bidReal, current: app.version,
+                if let r = await appStore(bundleId: bidReal, current: app.version, build: app.build,
                                           installedAt: app.installedAt, country: country,
                                           allowBeta: allowBeta) {
                     return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
@@ -548,7 +556,7 @@ enum Checker {
         var notes: String?
     }
 
-    static func sparkle(feed: String, current: String, allowBeta: Bool) async -> Outcome? {
+    static func sparkle(feed: String, current: String, build: String?, allowBeta: Bool) async -> Outcome? {
         guard let body = await Net.text(feed), !body.isEmpty else { return nil }
         let items = AppcastParser().parse(Data(body.utf8))
         guard !items.isEmpty else { return nil }
@@ -567,6 +575,15 @@ enum Checker {
             if !allowBeta, isBeta { continue }
             guard systemSatisfies(it.minSystem) else { continue }
             let latest = v
+            // 有的 Sparkle 源把构建号写进 title，本机装的已经是这个包 → 已是最新
+            if latestIsInstalledBuild(latest, current: current, build: build) {
+                return Outcome(status: .upToDate, latest: latest,
+                               url: it.enclosure ?? it.link ?? feed,
+                               homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
+                               note: nil,
+                               releaseDate: parseRFC822(it.pubDate),
+                               notes: plainNotes(it.notes))
+            }
             let newer = Ver.isNewer(latest, than: current)
             var notes = plainNotes(it.notes)
             if notes == nil, newer, let link = it.notesLink, let html = await Net.text(link) {
@@ -591,7 +608,7 @@ enum Checker {
         return nil
     }
 
-    static func appStore(bundleId: String, current: String, installedAt: Date?,
+    static func appStore(bundleId: String, current: String, build: String?, installedAt: Date?,
                          country: String, allowBeta: Bool) async -> Outcome? {
         let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=\(country)"
         guard let obj = await Net.json(url) as? [String: Any],
@@ -604,6 +621,12 @@ enum Checker {
         // 比商店产品页更像「软件网站」
         let seller = (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString }
         let release = parseISO8601(first["currentVersionReleaseDate"] as? String)
+
+        // 商店接口偶尔也会给构建号（开发者把 build 填进 version 字段）
+        if latestIsInstalledBuild(latest, current: current, build: build) {
+            return Outcome(status: .upToDate, latest: latest, url: page, homepage: seller,
+                           releaseDate: release)
+        }
 
         // 有些开发者发版时没同步 Mac 包里的 CFBundleShortVersionString，
         // 导致「商店 1.13、包内写着 1.4」。Apple 比的是构建号，认为已最新；
@@ -644,6 +667,11 @@ enum Rules {
         if !allowBeta, isPrereleaseVersion(latest) {
             return Checker.Outcome(status: .upToDate, latest: app.version, url: url, homepage: url,
                                    note: "只跟正式版比：更新源里最新的是测试版（\(latest)）",
+                                   releaseDate: releaseDate)
+        }
+        // 官网页面抓到的是构建号：本机装的已是这个包
+        if latestIsInstalledBuild(latest, current: app.version, build: app.build) {
+            return Checker.Outcome(status: .upToDate, latest: latest, url: url, homepage: url,
                                    releaseDate: releaseDate)
         }
         let newer = Ver.isNewer(latest, than: app.version)
