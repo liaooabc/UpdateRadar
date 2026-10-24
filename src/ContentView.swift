@@ -194,10 +194,22 @@ struct ContentView: View {
     // MARK: - 分段
 
     private var tabBar: some View {
-        HStack(spacing: 6) {
-            segButton("可更新 \(service.updateCount)", index: 0)
-            segButton("其他 \(service.rows.filter { !$0.isUpdate }.count)", index: 1)
+        HStack(spacing: 8) {
+            // 照 Apple 分段控件（照片 App 那个 日/周/月/年）做的：外面一条浅灰胶囊轨道，
+            // 选中的那一段是稍深一点的胶囊 + 一点投影，切换时滑过去。
+            HStack(spacing: 2) {
+                segButton("可更新 \(service.updateCount)", index: 0)
+                segButton("其他 \(service.rows.filter { !$0.isUpdate }.count)", index: 1)
+            }
+            .padding(3)
+            .background(
+                Capsule()
+                    .fill(Color.primary.opacity(0.055))
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.8))
+            )
+
             Spacer(minLength: 0)
+
             if ui.tab == 1 {
                 HStack(spacing: 4) {
                     Image(systemName: "magnifyingglass")
@@ -208,27 +220,42 @@ struct ContentView: View {
                         .font(.system(size: 11))
                         .frame(width: 78)
                 }
-                .padding(.horizontal, 7)
+                .padding(.horizontal, 8)
                 .padding(.vertical, 4)
-                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .background(
+                    Capsule()
+                        .fill(Color.primary.opacity(0.055))
+                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.07), lineWidth: 0.8))
+                )
             }
         }
         .padding(.horizontal, 14)
         .padding(.bottom, 8)
     }
 
+    /// 分段控件的滑块：用同一个 namespace，切换时会在两段之间滑过去
+    @Namespace private var segNS
+
     private func segButton(_ label: String, index: Int) -> some View {
-        Button {
-            ui.tab = index
+        let selected = ui.tab == index
+        return Button {
+            withAnimation(.easeInOut(duration: 0.18)) { ui.tab = index }
         } label: {
             Text(label)
-                .font(.system(size: 11, weight: ui.tab == index ? .semibold : .regular))
-                .foregroundStyle(ui.tab == index ? Color.primary : Color.secondary)
-                .padding(.horizontal, 9)
-                .padding(.vertical, 4)
-                .background(
-                    Capsule().fill(ui.tab == index ? Color.primary.opacity(0.12) : Color.clear)
-                )
+                .font(.system(size: 11.5, weight: selected ? .semibold : .regular))
+                .foregroundStyle(selected ? Color.primary : Color.secondary)
+                .padding(.horizontal, 11)
+                .padding(.vertical, 3.5)
+                .background {
+                    if selected {
+                        Capsule()
+                            .fill(Color.primary.opacity(0.13))
+                            .overlay(Capsule().strokeBorder(Color.primary.opacity(0.05), lineWidth: 0.5))
+                            .shadow(color: Color.black.opacity(0.07), radius: 1, y: 0.5)
+                            .matchedGeometryEffect(id: "seg-pill", in: segNS)
+                    }
+                }
+                .contentShape(Capsule())
         }
         .buttonStyle(.plain)
     }
