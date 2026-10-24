@@ -79,33 +79,44 @@ fi
 say "▸ 2/3 创建 Release ${TAG}"
 # 更新说明：改仓库根目录的「发布说明.md」就行（写多短都没关系）。
 # 没有这个文件时只写一行标题，不会再把上一版的长文案贴上去。
+# 注意：body 里有多行中文，**不能**用 shell 传参给 python3（会丢转义、生成非法 JSON），
+# 所以把发布说明写进临时文件，让 python 直接读文件。
+BODY_FILE="$(mktemp)"
 if [ -f "发布说明.md" ]; then
-    BODY=$(cat "发布说明.md")
+    cat "发布说明.md" > "${BODY_FILE}"
 else
-    BODY="## 更新雷达 ${VER}（Apple 芯片）"
+    printf '## 更新雷达 %s（Apple 芯片）\n' "${VER}" > "${BODY_FILE}"
 fi
-JSON=$(python3 - "${TAG}" "${VER}" "${BODY}" <<'PY'
+JSON_FILE="$(mktemp)"
+python3 - "${TAG}" "${VER}" "${BODY_FILE}" "${JSON_FILE}" <<'PY'
 import json, sys
-tag, ver, body = sys.argv[1], sys.argv[2], sys.argv[3]
-print(json.dumps({"tag_name": tag, "name": f"更新雷达 {ver}", "body": body,
-                  "draft": False, "prerelease": False}, ensure_ascii=False))
+tag, ver, body_file, out_file = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+with open(body_file, encoding="utf-8") as f:
+    body = f.read()
+with open(out_file, "w", encoding="utf-8") as f:
+    json.dump({"tag_name": tag, "name": f"更新雷达 {ver}", "body": body,
+               "draft": False, "prerelease": False}, f, ensure_ascii=False)
 PY
-)
 RESP=$(curl -sS -X POST "${API}/releases" \
     -H "Authorization: Bearer ${TOKEN}" \
     -H "Accept: application/vnd.github+json" \
     -H "Content-Type: application/json" \
-    -d "${JSON}")
+    --data-binary @"${JSON_FILE}")
+rm -f "${BODY_FILE}" "${JSON_FILE}"
 
-UP=$(python3 - "${RESP}" <<'PY'
+RESP_FILE="$(mktemp)"
+printf '%s' "${RESP}" > "${RESP_FILE}"
+UP=$(python3 - "${RESP_FILE}" <<'PY'
 import json, sys
 try:
-    d = json.loads(sys.argv[1])
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
 except Exception:
     print(""); raise SystemExit
 print(d.get("upload_url", "").split("{")[0])
 PY
 )
+rm -f "${RESP_FILE}"
 if [ -z "${UP}" ]; then
     say "  创建 Release 失败，GitHub 的原话："
     echo "${RESP}" | head -5 | sed 's/^/    /'
