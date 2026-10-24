@@ -198,6 +198,8 @@ struct ContentView: View {
 
     // MARK: - 分段
 
+    private static let barControlHeight: CGFloat = 26      // 分段轨道和搜索框的统一高度
+
     private var tabBar: some View {
         HStack(spacing: 8) {
             // 轨道是真的液态玻璃（系统 glassEffect），选中的那一段只是一层淡淡的中性胶囊：
@@ -212,17 +214,17 @@ struct ContentView: View {
             Spacer(minLength: 0)
 
             if ui.tab == 1 {
-                HStack(spacing: 4) {
+                // 尺寸/字号必须跟左边那条轨道一模一样：同一个高度、同一个 11.5 号字，
+                // 只靠 padding 凑容易差 2pt，所以两边都写死高度。
+                HStack(spacing: 5) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.secondary)
-                    TextField("搜索", text: $ui.query)
-                        .textFieldStyle(.plain)
                         .font(.system(size: 11))
-                        .frame(width: 78)
+                        .foregroundStyle(.secondary)
+                    SearchField(text: $ui.query)
+                        .frame(width: 82)
                 }
                 .padding(.horizontal, 10)
-                .padding(.vertical, 4)
+                .frame(height: Self.barControlHeight)
                 .modifier(GlassSearchField())
             }
         }
@@ -238,8 +240,8 @@ struct ContentView: View {
             Text(label)
                 .font(.system(size: 11.5, weight: selected ? .semibold : .regular))
                 .foregroundStyle(selected ? Color.primary : Color.secondary)
-                .padding(.horizontal, 11)
-                .padding(.vertical, 3.5)
+                .padding(.horizontal, 10)
+                .frame(height: Self.barControlHeight - 6)   // 轨道上下各留 3pt
                 .background {
                     if selected {
                         Capsule()
@@ -506,6 +508,56 @@ private struct GlassPill: ViewModifier {
             content
                 .background(Capsule().fill(Color.primary.opacity(0.06)))
                 .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+}
+
+/// 搜索输入框包成 NSTextField，是为了两件 SwiftUI 做不到的事：
+/// 1) placeholder 的字号——SwiftUI 的 TextField 会把「搜索」按系统 13 号画，跟左边 11.5 号的分段不一致；
+/// 2) 中文输入法打字时，SwiftUI 的 binding 要等选字/回车才更新，自己画的占位文字就会一直压在拼音上面。
+///    包成 AppKit 之后 placeholder 由系统管，一有字（包括还没上屏的拼音）就消失。
+private struct SearchField: NSViewRepresentable {
+    @Binding var text: String
+
+    final class Coordinator: NSObject, NSTextFieldDelegate {
+        var parent: SearchField
+        init(_ parent: SearchField) { self.parent = parent }
+
+        func controlTextDidChange(_ obj: Notification) {
+            guard let field = obj.object as? NSTextField else { return }
+            // 中文输入法还没上屏时，marked text 在 field editor 里，field.stringValue 还是空的；
+            // 读编辑器的 string 才能跟着拼音实时过滤，而不是等回车。
+            let editor = field.currentEditor() as? NSTextView
+            parent.text = editor?.string ?? field.stringValue
+        }
+    }
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSTextField {
+        let field = NSTextField()
+        field.isBordered = false
+        field.drawsBackground = false
+        field.focusRingType = .none
+        field.isEditable = true
+        field.font = .systemFont(ofSize: 11.5)
+        field.lineBreakMode = .byTruncatingTail
+        field.cell?.usesSingleLineMode = true
+        field.cell?.wraps = false
+        field.placeholderAttributedString = NSAttributedString(
+            string: "搜索",
+            attributes: [.font: NSFont.systemFont(ofSize: 11.5),
+                         .foregroundColor: NSColor.secondaryLabelColor]
+        )
+        field.delegate = context.coordinator
+        return field
+    }
+
+    func updateNSView(_ field: NSTextField, context: Context) {
+        context.coordinator.parent = self
+        // 只在外部真的改了内容时回写，别在用户打字（尤其拼音还没上屏）时去重置它
+        if field.stringValue != text, field.currentEditor() == nil {
+            field.stringValue = text
         }
     }
 }
