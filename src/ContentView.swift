@@ -152,18 +152,23 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
+            // 这颗按钮写文字而不是画个转圈箭头：12pt 的箭头缩在玻璃圆里认不出是在干嘛，
+            // 而且字形一粗就像个噪点。文字胶囊跟分段控件同一种形状、同一种玻璃。
             Button {
                 service.rescan()
                 service.checkAll(force: true)
             } label: {
-                Image(systemName: "arrow.clockwise")
-                    .font(.system(size: 13, weight: .medium))
-                    .frame(width: 24, height: 24)
+                Text("扫描")
+                    .font(.system(size: 11.5, weight: .medium))
+                    .padding(.horizontal, 11)
+                    .frame(height: 26)
+                    .contentShape(Capsule())
+                    .modifier(GlassPill())
             }
             .buttonStyle(.plain)
             .foregroundStyle(service.checking ? Color.secondary : Color.primary)
             .disabled(service.checking)
-            .help("立即检查")
+            .help("立即扫描")
         }
         .padding(.horizontal, 14)
         .padding(.top, 14)
@@ -172,7 +177,7 @@ struct ContentView: View {
 
     private var titleText: String {
         if service.checking && service.updateCount == 0 && service.lastCheck == nil {
-            return "正在检查…"
+            return "正在检测…"
         }
         if service.updateCount == 0 { return "全部都是最新的" }
         return "\(service.updateCount) 个 App 有新版本"
@@ -183,11 +188,11 @@ struct ContentView: View {
         if let d = service.lastCheck {
             let f = DateFormatter()
             f.dateFormat = "HH:mm"
-            time = "上次检查 \(f.string(from: d))"
+            time = "上次检测 \(f.string(from: d))"
         } else {
-            time = "还没有检查过"
+            time = "还没有检测过"
         }
-        let checking = service.checking ? " · 正在检查" : ""
+        let checking = service.checking ? " · 正在检测" : ""
         return "\(time) · 共 \(service.appCount) 个 App\(checking)"
     }
 
@@ -367,14 +372,15 @@ struct ContentView: View {
         .buttonStyle(.plain)
     }
 
+    /// 空状态按 App Store「更新」页那张空图来：一句大字标题 + 一句灰色说明，不放图标。
     private var emptyState: some View {
-        VStack(spacing: 8) {
+        VStack(spacing: 6) {
             Spacer()
-            Image(systemName: ui.tab == 0 ? "checkmark.seal.fill" : "square.stack.3d.up.slash")
-                .font(.system(size: 30))
-                .foregroundStyle(ui.tab == 0 ? accentMint : Color.secondary)
-            Text(ui.tab == 0 ? "没有待更新的 App" : "没有匹配的 App")
-                .font(.system(size: 12, weight: .medium))
+            Text(ui.tab == 0 ? "无更新" : "没有匹配的 App")
+                .font(.system(size: 21, weight: .semibold))
+                .foregroundStyle(.primary)
+            Text(ui.tab == 0 ? "所有 App 均为最新版本。" : "换个关键词试试")
+                .font(.system(size: 12))
                 .foregroundStyle(.secondary)
             Spacer()
         }
@@ -395,7 +401,7 @@ struct ContentView: View {
             Spacer()
 
             Menu {
-                Picker("检查频率", selection: Binding(
+                Picker("检测频率", selection: Binding(
                     get: { service.settings.intervalHours },
                     set: { service.setInterval($0) }
                 )) {
@@ -429,19 +435,18 @@ struct ContentView: View {
                     set: { service.setReceiveBeta($0) }
                 ))
                 Divider()
-                Button("打开数据文件夹") {
-                    NSWorkspace.shared.open(UpdateService.supportDir)
-                }
                 Button("退出") {
                     NSApp.terminate(nil)
                 }
             } label: {
-                Image(systemName: "gearshape")
-                    .font(.system(size: 12))
+                GlassIcon(systemName: "gearshape")
             }
-            .menuStyle(.borderlessButton)
+            // 必须用 .button 这套菜单样式：borderlessButton 会把 label 的背景整个丢掉，
+            // 玻璃画不上去（齿轮之前就是一坨平面图标）。.button + .plain 才跟刷新按钮长得一样。
+            .menuStyle(.button)
+            .buttonStyle(.plain)
             .menuIndicator(.hidden)
-            .frame(width: 20)
+            .fixedSize()
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -457,6 +462,46 @@ private struct GlassTrack: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
             content.glassEffect(.regular, in: .capsule)
+        } else {
+            content
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+}
+
+/// 圆形玻璃图标（刷新 / 设置齿轮共用）：同一个 28pt 圆、同一套玻璃材质。
+/// 玻璃必须画在 label **里面**——Menu 的 borderlessButton 会自己接管外层背景，
+/// 加在 Menu 外面的 glassEffect 完全不会出现（齿轮之前就是一坨平面图标的原因）。
+private struct GlassIcon: View {
+    let systemName: String
+    var body: some View {
+        Image(systemName: systemName)
+            .font(.system(size: 12.5, weight: .medium))
+            .frame(width: 28, height: 28)
+            .contentShape(Circle())
+            .modifier(GlassCircle())
+    }
+}
+
+/// 圆形玻璃按钮（刷新 / 设置齿轮用）：跟分段控件、搜索框同一套材质
+private struct GlassCircle: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .circle)
+        } else {
+            content
+                .background(Circle().fill(Color.primary.opacity(0.06)))
+                .overlay(Circle().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+}
+
+/// 文字胶囊玻璃（头部「扫描」用）：跟分段控件那条轨道同一个形状、同一套材质
+private struct GlassPill: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .capsule)
         } else {
             content
                 .background(Capsule().fill(Color.primary.opacity(0.06)))

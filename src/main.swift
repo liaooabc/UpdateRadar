@@ -10,6 +10,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let aboutController = AboutWindowController()
     private let ui = UIState()
     private var cancellable: AnyCancellable?
+    private var bobCancellable: AnyCancellable?
+
+    // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
+    // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
+    private var rippling = false
+    private var iconLayer: CALayer?
+    private var rippleLayers: [CAShapeLayer] = []
+    private static let rippleStart: CGFloat = 6.4     // 从环的内沿起
+    private static let rippleEnd: CGFloat = 11.2      // 扩到框边（22pt 的图标里环外径 8.6）
+    private static let ripplePeriod: CFTimeInterval = 1.6
+    static let iconInnerRadius: CGFloat = 6.3             // 环的内沿（22pt 图里环外径 17.2、线宽 2 → 内径 6.6）
 
     private let panelSize = NSSize(width: 364, height: 548)
 
@@ -35,6 +46,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         Notifier.shared.setup()
         Notifier.shared.onOpen = { [weak self] in self?.showPanel() }
+
+        // 调试用：UPDATERADAR_RIPPLE_ALWAYS=1 一直荡波，用来单量这段动画本身的开销
+        if ProcessInfo.processInfo.environment["UPDATERADAR_RIPPLE_ALWAYS"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.startRippling() }
+        }
+
+        // 扫描时菜单栏图标往外荡雷达波，扫完停回原样
+        bobCancellable = service.$checking
+            .receive(on: RunLoop.main)
+            .sink { [weak self] checking in
+                Task { @MainActor in
+                    if checking { self?.startRippling() } else { self?.stopRippling() }
+                }
+            }
 
         // 后台查完就刷新角标/图标，不用等用户点一下
         cancellable = service.$updateCount
@@ -90,6 +115,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func buildPopover() {
         let pop = NSPopover()
         pop.behavior = .transient          // 点别处 / 按 Esc 自动收起
+        // 调试用：UPDATERADAR_PIN_PANEL=1 时面板不自动收，方便 screencapture 核对长相
+        if ProcessInfo.processInfo.environment["UPDATERADAR_PIN_PANEL"] != nil {
+            pop.behavior = .applicationDefined
+        }
         pop.animates = true
         let host = NSHostingController(rootView: ContentView(service: service, ui: ui))
         pop.contentViewController = host
@@ -124,10 +153,124 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func updateBadge() {
         guard let button = statusItem.button else { return }
         let n = service.updateCount
-        button.image = makeStatusIcon()
+        if !rippling { button.image = makeStatusIcon() }
         button.font = NSFont.monospacedDigitSystemFont(ofSize: 11, weight: .semibold)
         button.title = (n > 0 && service.settings.countVisible) ? " \(n)" : ""
         button.toolTip = n > 0 ? "\(n) 个 App 有新版本" : "更新雷达 · 全部都是最新的"
+    }
+
+    // MARK: - 扫描时"雷达波"
+
+    /// 模板图是「黑剪影 + alpha」，塞进 CALayer 不会跟菜单栏明暗走，
+    /// 所以按当前外观染一份再交给图层。
+    private func tintedCGImage(_ image: NSImage, color: NSColor, scale: CGFloat) -> CGImage? {
+        let pxW = Int(image.size.width * scale), pxH = Int(image.size.height * scale)
+        guard pxW > 0, pxH > 0,
+              let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: pxW, pixelsHigh: pxH,
+                                         bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                         isPlanar: false, colorSpaceName: .deviceRGB,
+                                         bytesPerRow: 0, bitsPerPixel: 0),
+              let ctx = NSGraphicsContext(bitmapImageRep: rep) else { return nil }
+        rep.size = image.size
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = ctx
+        // bitmapImageRep 的 context 用户空间是像素，不缩放图标只画到一角、只有 1/4 大
+        ctx.cgContext.scaleBy(x: scale, y: scale)
+        image.draw(in: NSRect(origin: .zero, size: image.size))
+        color.set()
+        NSRect(origin: .zero, size: image.size).fill(using: .sourceIn)
+        NSGraphicsContext.restoreGraphicsState()
+        return rep.cgImage
+    }
+
+    /// 全透明但真有位图的同尺寸图，用来占住菜单栏里图标那一格
+    private func blankIcon(size: NSSize) -> NSImage {
+        let img = NSImage(size: size)
+        if let rep = NSBitmapImageRep(bitmapDataPlanes: nil,
+                                      pixelsWide: Int(size.width * 2), pixelsHigh: Int(size.height * 2),
+                                      bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true,
+                                      isPlanar: false, colorSpaceName: .deviceRGB,
+                                      bytesPerRow: 0, bitsPerPixel: 0) {
+            rep.size = size
+            img.addRepresentation(rep)
+        }
+        return img
+    }
+
+    private func circlePath(center: CGPoint, radius: CGFloat) -> CGPath {
+        CGPath(ellipseIn: CGRect(x: center.x - radius, y: center.y - radius,
+                                 width: radius * 2, height: radius * 2), transform: nil)
+    }
+
+    /// 扫描时图标本身不动，从环里往外荡两圈"雷达波"（一圈接一圈，很快但很淡）。
+    /// 菜单栏只有 17pt，动整个图标或者让箭头滚过去都会糊成一团；涟漪只加淡环，最干净。
+    private func startRippling() {
+        guard !rippling, let button = statusItem.button else { return }
+        rippling = true
+
+        let size = makeStatusIcon().size
+        button.image = blankIcon(size: size)
+        button.wantsLayer = true
+
+        let scale = button.window?.backingScaleFactor ?? 2
+        let dark = button.effectiveAppearance.bestMatch(from: [.aqua, .darkAqua]) == .darkAqua
+        let color: NSColor = dark ? .white : .black
+        var rect = NSRect(origin: .zero, size: size)
+        if let cell = button.cell as? NSButtonCell {
+            rect = cell.imageRect(forBounds: button.bounds)
+        }
+
+        // 图标本体：一直不动
+        let icon = CALayer()
+        icon.frame = rect
+        icon.contentsGravity = .resizeAspect
+        icon.contentsScale = scale
+        icon.contents = tintedCGImage(makeStatusIcon(), color: color, scale: scale)
+        button.layer?.addSublayer(icon)
+        iconLayer = icon
+
+        // 涟漪：两条弧线同时往外扩、边扩边淡，错开半个周期，看着是连续往外推
+        let center = CGPoint(x: rect.width / 2, y: rect.height / 2)
+        for i in 0..<2 {
+            let wave = CAShapeLayer()
+            wave.frame = rect
+            wave.fillColor = nil
+            wave.strokeColor = color.withAlphaComponent(0.7).cgColor
+            wave.lineWidth = 1.3
+            wave.path = circlePath(center: center, radius: Self.rippleStart)
+            wave.opacity = 0
+            button.layer?.addSublayer(wave)
+            rippleLayers.append(wave)
+
+            let grow = CABasicAnimation(keyPath: "path")
+            grow.fromValue = circlePath(center: center, radius: Self.rippleStart)
+            grow.toValue = circlePath(center: center, radius: Self.rippleEnd)
+
+            let fade = CAKeyframeAnimation(keyPath: "opacity")
+            fade.values = [0, 1, 1, 0]
+            fade.keyTimes = [0, 0.12, 0.55, 1]
+
+            for anim in [grow, fade] {
+                anim.duration = Self.ripplePeriod
+                anim.repeatCount = .infinity
+                anim.isRemovedOnCompletion = false
+                anim.timeOffset = CFTimeInterval(i) * Self.ripplePeriod / 2
+            }
+            wave.add(grow, forKey: "grow")
+            wave.add(fade, forKey: "fade")
+        }
+    }
+
+    private func stopRippling() {
+        guard rippling else { return }
+        rippling = false
+        for layer in rippleLayers + [iconLayer].compactMap({ $0 }) {
+            layer.removeAllAnimations()
+            layer.removeFromSuperlayer()
+        }
+        rippleLayers = []
+        iconLayer = nil
+        statusItem.button?.image = makeStatusIcon()
     }
 
     /// 菜单栏图标：18pt 的自绘模板图（圆圈 + 圆润箭头），跟最初那版一模一样。
@@ -208,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(about)
         menu.addItem(.separator())
 
-        let freqItem = NSMenuItem(title: "检查频率", action: nil, keyEquivalent: "")
+        let freqItem = NSMenuItem(title: "检测频率", action: nil, keyEquivalent: "")
         let freqMenu = NSMenu()
         for (hours, title) in [(1.0, "每小时"), (6.0, "每 6 小时"), (12.0, "每 12 小时"), (24.0, "每天")] {
             let item = NSMenuItem(title: title, action: #selector(setInterval(_:)), keyEquivalent: "")
@@ -233,7 +376,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(.separator())
 
-        let check = NSMenuItem(title: "检查更新", action: #selector(checkNow), keyEquivalent: "r")
+        let check = NSMenuItem(title: "检测更新", action: #selector(checkNow), keyEquivalent: "r")
         check.target = self
         check.isEnabled = !service.checking
         menu.addItem(check)

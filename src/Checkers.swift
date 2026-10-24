@@ -680,7 +680,7 @@ enum Rules {
                 // 403/429 不是「这个 App 坏了」，是配额用完了：如实说，别让用户以为软件出问题
                 return Checker.Outcome(
                     status: .failed, latest: nil, url: downloadPage, homepage: downloadPage,
-                    note: "GitHub 接口限流（未登录时每小时 60 次，同一网络下多台 Mac 共用配额）；过一会儿再看，或把检查频率调低")
+                    note: "GitHub 接口限流（未登录时每小时 60 次，同一网络下多台 Mac 共用配额）；过一会儿再看，或把检测频率调低")
             }
             return nil   // 404（仓库没了）和其他状态码：沿用旧行为，当作抓不到
         case .success(let obj):
