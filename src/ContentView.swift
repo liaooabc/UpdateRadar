@@ -75,6 +75,8 @@ final class HoverStore {
 struct ContentView: View {
     @ObservedObject var service: UpdateService
     @ObservedObject var ui: UIState
+    /// 底栏齿轮：打开设置窗口（窗口由 AppDelegate 持有）
+    var onOpenSettings: () -> Void = {}
 
     /// 「可更新」页的行：只列有新版本的，按名字排
     private var visibleRows: [AppRow] {
@@ -422,52 +424,13 @@ struct ContentView: View {
 
             Spacer()
 
-            Menu {
-                Picker("检测频率", selection: Binding(
-                    get: { service.settings.intervalHours },
-                    set: { service.setInterval($0) }
-                )) {
-                    Text("每小时").tag(1.0)
-                    Text("每 6 小时").tag(6.0)
-                    Text("每 12 小时").tag(12.0)
-                    Text("每天").tag(24.0)
-                }
-                Divider()
-                // 顺序（用户定稿）：菜单栏显示数量 → 打开系统通知设置 → 有新版本时通知我 → 只显示有检测源的 App
-                Toggle("菜单栏显示数量", isOn: Binding(
-                    get: { service.settings.countVisible },
-                    set: { service.setShowCount($0) }
-                ))
-                Button("打开系统通知设置") {
-                    if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
-                Toggle("有新版本时通知我", isOn: Binding(
-                    get: { service.settings.notifyEnabled },
-                    set: { service.setNotify($0) }
-                ))
-                Toggle("只显示有检测源的 App", isOn: Binding(
-                    get: { service.settings.hideUnknown },
-                    set: { service.setHideUnknown($0) }
-                ))
-                // 默认关：只跟正式版比，beta 不打扰。打开后重查一遍 appcast 源的 App。
-                Toggle("接收测试版更新", isOn: Binding(
-                    get: { service.settings.receiveBetaEnabled },
-                    set: { service.setReceiveBeta($0) }
-                ))
-                Divider()
-                Button("退出") {
-                    NSApp.terminate(nil)
-                }
-            } label: {
+            // 齿轮不再弹一长串菜单，直接打开设置窗口：
+            // 面板只有 364pt 宽，七八项设置塞进菜单里既挤又难找。
+            Button(action: onOpenSettings) {
                 GlassIcon(systemName: "gearshape")
             }
-            // 必须用 .button 这套菜单样式：borderlessButton 会把 label 的背景整个丢掉，
-            // 玻璃画不上去（齿轮之前就是一坨平面图标）。.button + .plain 才跟刷新按钮长得一样。
-            .menuStyle(.button)
             .buttonStyle(.plain)
-            .menuIndicator(.hidden)
+            .help("设置")
             .fixedSize()
         }
         .padding(.horizontal, 14)

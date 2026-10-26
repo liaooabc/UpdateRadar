@@ -8,9 +8,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover?
     private let service = UpdateService()
     private let aboutController = AboutWindowController()
+    private let updater = SelfUpdater()
+    private lazy var settingsController = SettingsWindowController(service: service, updater: updater)
     private let ui = UIState()
     private var cancellable: AnyCancellable?
     private var bobCancellable: AnyCancellable?
+    private var settingsCancellable: AnyCancellable?
+    private var selfCheckTimer: Timer?
 
     // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
     // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
@@ -35,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
+        buildMainMenu()
         buildPopover()
 
         // 面板开着的时候别弹"全部都是最新的"这种悬停提示，会盖在面板上
@@ -68,17 +73,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 Task { @MainActor in self?.updateBadge() }
             }
 
+        // 设置窗口里关掉「在菜单栏显示更新数量」时，这里立刻把角标收掉
+        settingsCancellable = service.$settings
+            .map(\.countVisible)
+            .removeDuplicates()
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in
+                Task { @MainActor in self?.updateBadge() }
+            }
+
         updateBadge()
         service.bootstrap()
+
+        // 本软件自己的更新：启动静默查一次，之后每 24 小时查一次（设置面板里也有手动按钮）
+        DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
+            self?.updater.checkIfStale()
+        }
+        selfCheckTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in self?.updater.check() }
+        }
 
         let env = ProcessInfo.processInfo.environment
         if env["UPDATERADAR_FORCE_DARK"] != nil { NSApp.appearance = NSAppearance(named: .darkAqua) }
         if env["UPDATERADAR_FORCE_LIGHT"] != nil { NSApp.appearance = NSAppearance(named: .aqua) }
+        if env["UPDATERADAR_SHOW_SETTINGS"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showSettings() }
+        }
         if env["UPDATERADAR_SHOW_ABOUT"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.aboutController.show() }
         }
         if env["UPDATERADAR_SHOW_MENU"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showStatusMenu() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                NSApp.activate(ignoringOtherApps: true)
+                self?.showStatusMenu()
+            }
         }
         // 调试用：UPDATERADAR_SET_BETA=0/1 起来 4 秒后按下/松开「接收测试版」开关，
         // 用来看「切开关只重查受影响的 App」这条路径
@@ -120,11 +148,46 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             pop.behavior = .applicationDefined
         }
         pop.animates = true
-        let host = NSHostingController(rootView: ContentView(service: service, ui: ui))
+        let host = NSHostingController(rootView: ContentView(service: service, ui: ui,
+                                                             onOpenSettings: { [weak self] in
+                                                                 self?.showSettings()
+                                                             }))
         pop.contentViewController = host
         pop.contentSize = panelSize
         popover = pop
     }
+
+    // MARK: - 设置
+
+    /// 面板收起、窗口浮上来。设置窗口是独立窗口，打开时不必再留在面板里。
+    private func showSettings() {
+        hidePanel()
+        settingsController.show()
+    }
+
+    /// 一句极简主菜单：只是为了让 ⌘, 和 ⌘Q 有地方挂。
+    /// 菜单栏本身不显示（LSUIElement / .accessory），键等价物照样生效。
+    private func buildMainMenu() {
+        let main = NSMenu()
+
+        let appItem = NSMenuItem()
+        let appMenu = NSMenu()
+        let settings = NSMenuItem(title: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
+        settings.target = self
+        appMenu.addItem(settings)
+        let close = NSMenuItem(title: "关闭窗口", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w")
+        appMenu.addItem(close)
+        appMenu.addItem(.separator())
+        let quit = NSMenuItem(title: "退出更新雷达", action: #selector(quitApp), keyEquivalent: "q")
+        quit.target = self
+        appMenu.addItem(quit)
+        appItem.submenu = appMenu
+        main.addItem(appItem)
+
+        NSApp.mainMenu = main
+    }
+
+    @objc private func openSettingsFromMenu() { showSettings() }
 
     private func showPanel() {
         guard let popover, !popover.isShown, let button = statusItem.button else { return }
@@ -342,6 +405,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 右键菜单
 
+    /// 右键菜单（用户定稿 2026-10-26）：关于 / 设置 / 检测更新 / 退出。
+    /// 检测频率、菜单栏显示数量、通知开关都搬进设置窗口了，菜单里不再重复。
     private func showStatusMenu() {
         let menu = NSMenu()
         menu.autoenablesItems = false
@@ -349,30 +414,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let about = NSMenuItem(title: "关于", action: #selector(showAbout), keyEquivalent: "")
         about.target = self
         menu.addItem(about)
-        menu.addItem(.separator())
 
-        let freqItem = NSMenuItem(title: "检测频率", action: nil, keyEquivalent: "")
-        let freqMenu = NSMenu()
-        for (hours, title) in [(1.0, "每小时"), (6.0, "每 6 小时"), (12.0, "每 12 小时"), (24.0, "每天")] {
-            let item = NSMenuItem(title: title, action: #selector(setInterval(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = hours
-            item.state = abs(service.settings.intervalHours - hours) < 0.01 ? .on : .off
-            freqMenu.addItem(item)
-        }
-        freqItem.submenu = freqMenu
-        menu.addItem(freqItem)
-
-        // 顺序按用户定稿：检查频率 → 菜单栏显示数量 → 有新版本时通知我
-        let showCount = NSMenuItem(title: "菜单栏显示数量", action: #selector(toggleShowCount), keyEquivalent: "")
-        showCount.target = self
-        showCount.state = service.settings.countVisible ? .on : .off
-        menu.addItem(showCount)
-
-        let notify = NSMenuItem(title: "有新版本时通知我", action: #selector(toggleNotify), keyEquivalent: "")
-        notify.target = self
-        notify.state = service.settings.notifyEnabled ? .on : .off
-        menu.addItem(notify)
+        let settings = NSMenuItem(title: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
+        settings.target = self
+        menu.addItem(settings)
 
         menu.addItem(.separator())
 

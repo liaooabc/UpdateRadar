@@ -169,6 +169,14 @@ final class UpdateService: ObservableObject {
         save()
     }
 
+    /// 设置面板里的「全部恢复提醒」：一次性清掉忽略名单
+    func unignoreAll() {
+        guard !settings.ignored.isEmpty else { return }
+        settings.ignored.removeAll()
+        rebuild()
+        save()
+    }
+
     func setInterval(_ hours: Double) {
         settings.intervalHours = hours
         scheduleTimer()
