@@ -14,20 +14,22 @@ say() { echo "$1"; }
 if [ ! -f "${CFG}" ]; then
     mkdir -p "${CFG_DIR}"
     cat > "${CFG}" <<'EOF'
-# 填三行，保存关掉窗口，再双击一次「发布到GitHub.command」
+# 填两行，保存关掉窗口，再双击一次「发布到GitHub.command」
 OWNER=你的GitHub用户名
 REPO=UpdateRadar
-# 令牌：GitHub → 右上角头像 → Settings → Developer settings
+# 令牌不用写在这个文件里：脚本会把它存进 macOS 钥匙串
+#   （服务 github.com，账号 x-access-token），remote 地址里也不会带令牌
+# 生成令牌：GitHub → 右上角头像 → Settings → Developer settings
 #      → Personal access tokens → Fine-grained tokens → Generate new token
 #      勾 Repository access: All repositories（或只选这一个仓库）
 #      Permissions 里给 Contents: Read and write、Releases 也给 Read and write
-TOKEN=粘贴令牌在这里
 EOF
     chmod 600 "${CFG}"
     open -e "${CFG}"
     say "小星：第一次用，先把账号信息填一下。"
     say "我已经打开配置文件了：${CFG}"
-    say "把 OWNER 改成你的 GitHub 用户名、TOKEN 换成令牌（REPO 想叫别的也可以改），保存后关窗口，再双击我一次。"
+    say "把 OWNER 改成你的 GitHub 用户名（REPO 想叫别的也可以改），保存后关窗口，再双击我一次。"
+    say "令牌这次不用填了，第二次双击时我会问你要一次，拿到就存进钥匙串。"
     echo; read -n 1 -s -r -p "按任意键关闭"
     exit 0
 fi
@@ -36,12 +38,52 @@ set -a
 # shellcheck disable=SC1090
 . "${CFG}"
 set +a
+TOKEN_CFG="${TOKEN:-}"     # 老配置里可能还留着 TOKEN=，下面会把它搬进钥匙串再抹掉
 
-if [ "${OWNER:-}" = "你的GitHub用户名" ] || [ "${TOKEN:-}" = "粘贴令牌在这里" ] || [ -z "${OWNER:-}" ] || [ -z "${TOKEN:-}" ] || [ -z "${REPO:-}" ]; then
+if [ "${OWNER:-}" = "你的GitHub用户名" ] || [ -z "${OWNER:-}" ] || [ -z "${REPO:-}" ]; then
     open -e "${CFG}"
-    say "配置还没填完：OWNER / REPO / TOKEN 三行都要有值。已经帮你打开文件了。"
+    say "配置还没填完：OWNER / REPO 两行都要有值。已经帮你打开文件了。"
     echo; read -n 1 -s -r -p "按任意键关闭"
     exit 1
+fi
+
+# ── 0.5 令牌：只走钥匙串，不进任何文件 ──────────────────────
+KC_SERVICE="github.com"
+KC_ACCOUNT="x-access-token"
+
+kc_get() {  # 从登录钥匙串取令牌（走 git 官方 helper，不触发钥匙串弹窗）
+    printf 'protocol=https\nhost=%s\nusername=%s\n\n' "${KC_SERVICE}" "${KC_ACCOUNT}" \
+        | git credential-osxkeychain get 2>/dev/null | sed -n 's/^password=//p'
+}
+
+kc_put() {  # 把令牌写进登录钥匙串
+    [ -n "${1:-}" ] || return 1
+    printf 'protocol=https\nhost=%s\nusername=%s\npassword=%s\n\n' \
+        "${KC_SERVICE}" "${KC_ACCOUNT}" "$1" | git credential-osxkeychain store
+}
+
+TOKEN="$(kc_get)"
+if [ -z "${TOKEN}" ]; then
+    if [ -n "${TOKEN_CFG}" ] && [ "${TOKEN_CFG}" != "粘贴令牌在这里" ]; then
+        TOKEN="${TOKEN_CFG}"
+        say "把配置文件里的令牌搬进钥匙串（配置里不再保留明文）"
+        if kc_put "${TOKEN}"; then
+            sed -i '' -E 's|^TOKEN=.*|# TOKEN 已存进 macOS 钥匙串（服务 github.com、账号 x-access-token），这里不用再填|' "${CFG}" \
+                && say "  已把配置里的 TOKEN 那行注释掉"
+        fi
+    else
+        say "第一次用：把 GitHub 令牌粘进来（输入时不显示），只会存进钥匙串。"
+        printf '  令牌：'
+        read -r -s TOKEN; echo
+    fi
+    if [ -z "${TOKEN}" ]; then
+        say "没拿到令牌，先退出了。"
+        echo; read -n 1 -s -r -p "按任意键关闭"; exit 1
+    fi
+    kc_put "${TOKEN}" || { say "写钥匙串失败，先退出了。"; echo; read -n 1 -s -r -p "按任意键关闭"; exit 1; }
+    say "  令牌已存进钥匙串（服务 github.com，账号 x-access-token），以后不用再输入。"
+else
+    say "令牌已从钥匙串读取。"
 fi
 
 VER=$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Info.plist)
@@ -54,7 +96,9 @@ echo
 # ── 1. 源码推上去 ─────────────────────────────────────────
 say "▸ 1/3 推送源码"
 git remote remove origin >/dev/null 2>&1 || true
-git remote add origin "https://x-access-token:${TOKEN}@github.com/${OWNER}/${REPO}.git"
+# 令牌不进 URL：URL 只带用户名，密码由钥匙串里的凭据提供
+git config credential.helper osxkeychain
+git remote add origin "https://x-access-token@github.com/${OWNER}/${REPO}.git"
 git branch -M main >/dev/null 2>&1 || true
 git add -A >/dev/null 2>&1
 git -c user.name="${OWNER}" -c user.email="${OWNER}@users.noreply.github.com" \
