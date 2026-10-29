@@ -503,8 +503,47 @@ enum Checker {
     /// - Parameter previous: 上一轮的检测结果。官网只放安装包、不写版本号的 App
     ///   （扣子桌面端这种）要靠它比「官网的包是不是换了」
     /// - Parameter allowBeta: 用户打开了「接收测试版」时才为 true；默认只跟正式版比
+    /// 检测一个 App。**顺序很重要**：从 Mac App Store 装的先问商店 —— 商店才是这个包的更新通道。
+    /// 商店包和「官网直接下载版」是两条独立的通道，版本号常常压根不是一套
+    /// （QQ 商店 7.0.2 / 官网 6.9.x；WPS 商店 12.1.29182 / 官网 12.1.x）：
+    /// 拿官网或 appcast 的版本去跟商店包比，只会误报「有新版本」，点进去还得自己下载安装包。
     static func check(_ app: InstalledApp, previous: CheckResult? = nil,
                       allowBeta: Bool = false) async -> CheckResult {
+        guard app.isAppStore, let bid = app.bundleId else {
+            return await checkOtherSources(app, previous: previous, allowBeta: allowBeta)
+        }
+        let now = Date()
+
+        // 1. 商店：国区、美区各查一次。iTunes lookup 是分区的 —— 国区没上架的 App 在 cn 上
+        //    返回 resultCount=0，会被误判成「不在商店」，所以国区查不到时才去问美区。
+        for country in ["cn", "us"] {
+            if let r = await appStore(bundleId: bid, current: app.version, build: app.build,
+                                      installedAt: app.installedAt, country: country,
+                                      allowBeta: allowBeta) {
+                return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
+                                   downloadURL: r.url, homepage: r.homepage, note: r.note,
+                                   source: "appstore", checkedAt: now,
+                                   releaseDate: r.releaseDate, notes: r.notes)
+            }
+        }
+
+        // 2. 商店里没有这个 App（下架了，或只在别的区上架）：退回官网那几路，
+        //    但要说明白这条不是商店的版本，更新得去官网装
+        var r = await checkOtherSources(app, previous: previous, allowBeta: allowBeta)
+        r.note = mergeNotes(r.note,
+                            "App Store 里查不到这个 App（已下架，或只在别的区上架），这条是按官网/更新源比的")
+        return r
+    }
+
+    /// 有说明就接在后面，别覆盖掉原来的理由
+    private static func mergeNotes(_ note: String?, _ extra: String) -> String {
+        guard let note, !note.isEmpty else { return extra }
+        return note + "；" + extra
+    }
+
+    /// 商店之外的检测源：厂商规则 → Sparkle appcast → Homebrew Cask
+    private static func checkOtherSources(_ app: InstalledApp, previous: CheckResult?,
+                                          allowBeta: Bool) async -> CheckResult {
         let bid = app.id
         let now = Date()
 
@@ -543,22 +582,7 @@ enum Checker {
             return failed("更新源没有响应")
         }
 
-        // 3. Mac App Store 上架的应用（不在商店里属于正常情况，算无检测源）
-        // iTunes lookup 是分区的：国区没上架的 App 在 cn 上返回 resultCount=0，
-        // 会被误判成「不在商店」。所以国区查不到时再试一次美区，只在没命中时才多发请求。
-        if let bidReal = app.bundleId, app.isAppStore {
-            for country in ["cn", "us"] {
-                if let r = await appStore(bundleId: bidReal, current: app.version, build: app.build,
-                                          installedAt: app.installedAt, country: country,
-                                          allowBeta: allowBeta) {
-                    return CheckResult(bundleId: bidReal, status: r.status, latest: r.latest,
-                                       downloadURL: r.url, homepage: r.homepage, note: nil, source: "appstore",
-                                       checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
-                }
-            }
-        }
-
-        // 4. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
+        // 3. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
         if let entry = await Cask.lookup(app) {
             return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
         }
@@ -674,9 +698,16 @@ enum Checker {
                            note: "只跟正式版比：商店里最新的是测试版（\(latest)）", releaseDate: release)
         }
         let isNewer = Ver.isNewer(latest, than: current)
+        // 商店给的版本号比包内标注的还低：Apple 这个接口对「iOS 和 Mac 是同一个商品」的 App
+        // （Final Cut 的 com.apple.FinalCutApp、Logic、MacWhisper）返回的是 iOS 那边的版本号，
+        // 跟 Mac 包压根不是一套，没法比 —— 按已是最新算，别硬凑一个假更新出来
+        let storeLooksOlder = !isNewer && Ver.isNewer(current, than: latest)
         // 同上：不是新版本也留着更新说明，点开能看
         return Outcome(status: isNewer ? .updateAvailable : .upToDate,
-                       latest: latest, url: page, homepage: seller, note: nil,
+                       latest: latest, url: page, homepage: seller,
+                       note: storeLooksOlder
+                           ? "商店接口给的是 \(latest)，本机包标注 \(current)：这类通用 App 商店返回的是 iOS 版本号，跟 Mac 包没法比，先按已是最新算"
+                           : nil,
                        releaseDate: release,
                        notes: plainNotes(first["releaseNotes"] as? String))
     }

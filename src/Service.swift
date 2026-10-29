@@ -128,11 +128,12 @@ final class UpdateService: ObservableObject {
         }
     }
 
-    /// 先查有检测源的，用户能更快看到有用结果
+    /// 先查有检测源的，用户能更快看到有用结果。
+    /// 商店里的排最前：就一两个请求、回得最快，而且它们只认商店的版本号
     private func priority(_ app: InstalledApp) -> Int {
-        if Rules.match(app) != nil { return 3 }
-        if app.sparkleFeed != nil { return 2 }
-        if app.isAppStore { return 1 }
+        if app.isAppStore { return 3 }
+        if Rules.match(app) != nil { return 2 }
+        if app.sparkleFeed != nil { return 1 }
         return 0
     }
 
