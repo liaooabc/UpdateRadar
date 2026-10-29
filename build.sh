@@ -36,7 +36,7 @@ DEVELOPER_DIR="$CLT_DEV" swiftc -O -whole-module-optimization \
     -o "$APP/Contents/MacOS/UpdateRadar" \
     "$SRC"/*.swift
 
-echo "▸ 图标（Icon Composer 图层包：底板 / 圆盘 / 光环 / 箭头，白天 + 暗夜）"
+echo "▸ 图标（Icon Composer 图层包：满幅底板 + 圆环箭头图形，黑白两套）"
 ICON_DOC="$ROOT/Resources/AppIcon.icon"      # 设计源文件（8 个 SVG + icon.json，可再用 Icon Composer 打开改）
 ICON_PKG="$BUILD/AppIcon.icon"               # actool 只认这个位置，换路径会静默不产出
 ICON_BIN="$BUILD/make_icon"                  # 兜底：万一 .icon 编不出来，用代码现画一套

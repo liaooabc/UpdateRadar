@@ -4,21 +4,11 @@
     {
       "layers": [
         {
-          "image-name": "03-arrow-day.svg",
-          "name": "3_Arrow_Day",
+          "image-name": "01-glyph-day.svg",
+          "name": "1_Glyph_Day",
           "opacity-specializations": [
             {
               "appearance": "dark",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "03-arrow-night.svg",
-          "name": "3_Arrow_Night",
-          "opacity-specializations": [
-            {
-              "appearance": "light",
               "value": 0.0
             },
             {
@@ -28,58 +18,16 @@
           ]
         },
         {
-          "image-name": "02-ring-day.svg",
-          "name": "2_Ring_Day",
-          "opacity-specializations": [
-            {
-              "appearance": "dark",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "02-ring-night.svg",
-          "name": "2_Ring_Night",
+          "image-name": "01-glyph-night.svg",
+          "name": "1_Glyph_Night",
           "opacity-specializations": [
             {
               "appearance": "light",
-              "value": 0.0
-            },
-            {
-              "appearance": "tinted",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "01-plate-day.svg",
-          "name": "1_Plate_Day",
-          "opacity-specializations": [
-            {
-              "appearance": "dark",
-              "value": 0.0
-            }
-          ]
-        },
-        {
-          "image-name": "01-plate-night.svg",
-          "name": "1_Plate_Night",
-          "opacity-specializations": [
-            {
-              "appearance": "light",
-              "value": 0.0
-            },
-            {
-              "appearance": "tinted",
               "value": 0.0
             }
           ]
         }
-      ],
-      "shadow": {
-        "kind": "neutral",
-        "opacity": 0.5
-      }
+      ]
     },
     {
       "layers": [
@@ -104,22 +52,10 @@
             {
               "appearance": "light",
               "value": 0.0
-            },
-            {
-              "appearance": "tinted",
-              "value": 0.0
             }
           ]
         }
-      ],
-      "shadow": {
-        "kind": "neutral",
-        "opacity": 0.3
-      },
-      "translucency": {
-        "enabled": true,
-        "value": 0.3
-      }
+      ]
     }
   ],
   "supported-platforms": {
