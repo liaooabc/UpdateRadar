@@ -219,6 +219,31 @@ enum Net {
         return URLSession(configuration: c)
     }()
 
+    /// GitHub latest-release 的条件请求缓存。
+    /// 带上 If-None-Match 后，release 没变就是 304，而 304 不计入 GitHub 的配额；
+    /// 未登录只有 60 次/小时，不这么做 136 个 App 里 GitHub 源那部分很快就撞 403。
+    private final class ETagCache: @unchecked Sendable {
+        private let lock = NSLock()
+        private var entries: [String: (etag: String, data: Data)] = [:]
+
+        func entry(_ key: String) -> (etag: String, data: Data)? {
+            lock.lock(); defer { lock.unlock() }
+            return entries[key]
+        }
+
+        func store(_ key: String, etag: String, data: Data) {
+            lock.lock(); defer { lock.unlock() }
+            entries[key] = (etag, data)
+        }
+
+        func remove(_ key: String) {
+            lock.lock(); defer { lock.unlock() }
+            entries[key] = nil
+        }
+    }
+
+    private static let etags = ETagCache()
+
     /// raw.githubusercontent.com 在国内时通时不通，用 jsDelivr 做镜像兜底
     private static func jsdelivrMirror(_ urlString: String) -> String? {
         guard let url = URL(string: urlString), url.host == "raw.githubusercontent.com" else { return nil }
@@ -293,15 +318,29 @@ enum Net {
 
     /// GitHub 专用：区分「限流」和「仓库没了」。
     /// 未认证配额只有 60 次/小时/IP（同一个 Wi-Fi 下几台 Mac 共用），撞墙时要说清原因。
+    /// 每次带上次的 ETag：release 没变 → 304 → 不计配额。
     static func githubLatestRelease(_ repo: String) async -> Result<[String: Any]?, HTTPError> {
         let url = "https://api.github.com/repos/\(repo)/releases/latest"
         guard let u = URL(string: url) else { return .success(nil) }
+        var request = URLRequest(url: u)
+        request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
+        if let hit = etags.entry(url) {
+            request.setValue(hit.etag, forHTTPHeaderField: "If-None-Match")
+        }
         do {
-            let (data, resp) = try await session.data(from: u)
+            let (data, resp) = try await session.data(for: request)
             guard let http = resp as? HTTPURLResponse else { return .success(nil) }
+            if http.statusCode == 304, let hit = etags.entry(url) {
+                return .success(try? JSONSerialization.jsonObject(with: hit.data) as? [String: Any])
+            }
             guard (200..<300).contains(http.statusCode) else {
+                // 403/429 说明配额已经用完，缓存留着也没用（ETag 也不会让 304 生效）
+                etags.remove(url)
                 let remain = http.value(forHTTPHeaderField: "X-RateLimit-Remaining").flatMap(Int.init)
                 return .failure(HTTPError(status: http.statusCode, rateLimitRemaining: remain))
+            }
+            if let etag = http.value(forHTTPHeaderField: "ETag") {
+                etags.store(url, etag: etag, data: data)
             }
             return .success(try? JSONSerialization.jsonObject(with: data) as? [String: Any])
         } catch {
@@ -514,25 +553,55 @@ enum Checker {
         }
         let now = Date()
 
-        // 1. 商店：国区、美区各查一次。iTunes lookup 是分区的 —— 国区没上架的 App 在 cn 上
-        //    返回 resultCount=0，会被误判成「不在商店」，所以国区查不到时才去问美区。
-        for country in ["cn", "us"] {
-            if let r = await appStore(bundleId: bid, current: app.version, build: app.build,
-                                      installedAt: app.installedAt, country: country,
-                                      allowBeta: allowBeta) {
-                return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
-                                   downloadURL: r.url, homepage: r.homepage, note: r.note,
-                                   source: "appstore", checkedAt: now,
-                                   releaseDate: r.releaseDate, notes: r.notes)
-            }
+        // 1. 商店：cn 和 us 并行查，**取两个里版本号更高的**。
+        //    iTunes lookup 每个区走自己的 CDN 节点，发版后不同区刷新时间差可能超过 1 小时；
+        //    之前串行查 cn 有结果就不查 us，经常正好撞上 cn 还缓存着旧数据、us 已经刷了的情况。
+        async let cnOutcome = appStore(bundleId: bid, current: app.version, build: app.build,
+                                       installedAt: app.installedAt, country: "cn",
+                                       allowBeta: allowBeta)
+        async let usOutcome = appStore(bundleId: bid, current: app.version, build: app.build,
+                                       installedAt: app.installedAt, country: "us",
+                                       allowBeta: allowBeta)
+        let outcomes = [await cnOutcome, await usOutcome].compactMap { $0 }
+
+        if let best = pickBestAppStoreOutcome(outcomes) {
+            return CheckResult(bundleId: bid, status: best.status, latest: best.latest,
+                               downloadURL: best.url, homepage: best.homepage, note: best.note,
+                               source: "appstore", checkedAt: now,
+                               releaseDate: best.releaseDate, notes: best.notes)
         }
 
-        // 2. 商店里没有这个 App（下架了，或只在别的区上架）：退回官网那几路，
-        //    但要说明白这条不是商店的版本，更新得去官网装
-        var r = await checkOtherSources(app, previous: previous, allowBeta: allowBeta)
-        r.note = mergeNotes(r.note,
-                            "App Store 里查不到这个 App（已下架，或只在别的区上架），这条是按官网/更新源比的")
-        return r
+        // 2. MAS 版 App 但 iTunes lookup 也查不到（已下架、bundleId 对不上、网络故障）。
+        //    关键：**MAS 版绝不能 fallback 到官网 / Sparkle / Cask 去查版本号**。
+        //    商店包和官网版经常不是一套版本号（QQ 商店 7.0.2 vs 官网 6.9.x），
+        //    拿官网的版本去跟商店包比只会误报更新，用户点进去还得自己重新下载。
+        //    要么说「商店查不到」，要么说「检测失败」，就这两条路。
+        let reason: String?
+        if outcomes.isEmpty {
+            // cn 和 us 两个都返回 nil：要么 iTunes lookup 真没这个 App（下架），要么网络全挂了
+            reason = "从 App Store 装的，但商店查不到这个 App（可能已下架，或 bundleId 不匹配）"
+        } else {
+            reason = "从 App Store 装的，但商店接口返回异常"
+        }
+        return CheckResult(bundleId: bid, status: .unknown, latest: nil,
+                           downloadURL: nil, note: reason, source: "manual",
+                           checkedAt: now)
+    }
+
+    /// cn 和 us 两个 iTunes lookup 都返回了 Outcome 时，挑一个更可信的：
+    /// - 两个版本号不一样 → 取版本号更高的（一个 CDN 刷新了、另一个还没）
+    /// - 版本号一样 → 哪个是 cn 取哪个（国内用户更大概率从国区商店装）
+    private static func pickBestAppStoreOutcome(_ outcomes: [Outcome]) -> Outcome? {
+        guard !outcomes.isEmpty else { return nil }
+        if outcomes.count == 1 { return outcomes[0] }
+        // 两个都有版本号 → 取更新的
+        var best = outcomes[0]
+        for o in outcomes.dropFirst() {
+            if let bv = best.latest, let ov = o.latest, Ver.isNewer(ov, than: bv) {
+                best = o
+            }
+        }
+        return best
     }
 
     /// 有说明就接在后面，别覆盖掉原来的理由
@@ -665,7 +734,10 @@ enum Checker {
 
     static func appStore(bundleId: String, current: String, build: String?, installedAt: Date?,
                          country: String, allowBeta: Bool) async -> Outcome? {
-        let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=\(country)"
+        // 加时间戳：Apple CDN 会把 iTunes lookup 结果缓存 24h，
+        // 我们虽然已经关了 URLSession 缓存，但 Akamai 中间层可能还是按 URL 缓存，
+        // 加个 &_=timestamp 让每次请求的 URL 都不一样，彻底绕开。
+        let url = "https://itunes.apple.com/lookup?bundleId=\(bundleId)&country=\(country)&_=\(Int(Date().timeIntervalSince1970))"
         guard let obj = await Net.json(url) as? [String: Any],
               let count = obj["resultCount"] as? Int, count > 0,
               let results = obj["results"] as? [[String: Any]],
@@ -771,7 +843,7 @@ enum Rules {
                 // 403/429 不是「这个 App 坏了」，是配额用完了：如实说，别让用户以为软件出问题
                 return Checker.Outcome(
                     status: .failed, latest: nil, url: downloadPage, homepage: downloadPage,
-                    note: "GitHub 接口限流（未登录时每小时 60 次，同一网络下多台 Mac 共用配额）；过一会儿再看，或把检测频率调低")
+                    note: "GitHub 接口限流（未登录时每小时 60 次，同一网络下多台 Mac 共用配额）；过一会儿再看，或把扫描间隔调长")
             }
             return nil   // 404（仓库没了）和其他状态码：沿用旧行为，当作抓不到
         case .success(let obj):

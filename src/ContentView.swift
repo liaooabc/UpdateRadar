@@ -1,8 +1,12 @@
 import AppKit
 import SwiftUI
 
-private let accentMint = Color(red: 0.16, green: 0.72, blue: 0.62)
-private let warnAmber = Color(red: 0.98, green: 0.62, blue: 0.16)
+private let warnAmber = Color.orange
+
+extension Notification.Name {
+    /// ⌘F：菜单栏点「搜索」后，让搜索框成为第一响应者
+    static let updateRadarFocusSearch = Notification.Name("UpdateRadarFocusSearch")
+}
 
 /// 界面自身的小状态。用 ObservableObject 而不是 @State，因为这台机器只有
 /// Command Line Tools，SwiftUI 的宏插件（@State 依赖它）不可用。
@@ -15,9 +19,15 @@ final class UIState: ObservableObject {
     let hovers = HoverStore()
     /// 哪几行展开了更新说明（左键点一下展开，再点收起）
     @Published var expanded: Set<String> = []
+    /// 分段控件里鼠标正停在那一格（nil = 鼠标不在轨道上）
+    @Published var hoverTab: Int?
+    /// 两格各自在轨道里的位置，用来让「提前选框」滑过去
+    @Published var tabFrames: [Int: CGRect] = [:]
 
     /// 刚点开的那一行：列表要把它滚进视野
     private(set) var lastToggled: String?
+    /// 键盘（↑↓）选中的行；Return 打开它的下载页 / 在 Finder 中显示
+    @Published var keyRow: String?
     /// 每一行在列表可视区里的位置（不发布，只给「要不要滚」用，避免滚动时反复重绘）
     var rowFrames: [String: CGRect] = [:]
 
@@ -147,21 +157,20 @@ struct ContentView: View {
         HStack(alignment: .top, spacing: 10) {
             VStack(alignment: .leading, spacing: 3) {
                 Text(titleText)
-                    .font(.system(size: 15, weight: .semibold))
+                    .font(.title3.weight(.semibold))
                     .foregroundStyle(.primary)
                 Text(subtitleText)
-                    .font(.system(size: 11))
+                    .font(.subheadline)
                     .foregroundStyle(.secondary)
             }
             Spacer()
             // 这颗按钮写文字而不是画个转圈箭头：12pt 的箭头缩在玻璃圆里认不出是在干嘛，
             // 而且字形一粗就像个噪点。文字胶囊跟分段控件同一种形状、同一种玻璃。
             Button {
-                service.rescan()
-                service.checkAll(force: true)
+                service.rescan(thenCheck: true, force: true)
             } label: {
                 Text("扫描")
-                    .font(.system(size: 11.5, weight: .medium))
+                    .font(.subheadline.weight(.medium))
                     .padding(.horizontal, 11)
                     .frame(height: 26)
                     .contentShape(Capsule())
@@ -211,6 +220,9 @@ struct ContentView: View {
                 segButton("其他 \(service.rows.filter { !$0.isUpdate }.count)", index: 1)
             }
             .padding(3)
+            .coordinateSpace(name: "tabTrack")
+            .background(alignment: .topLeading) { tabPreview }
+            .onPreferenceChange(TabFrameKey.self) { ui.tabFrames = $0 }
             .modifier(GlassTrack())
 
             Spacer(minLength: 0)
@@ -220,7 +232,7 @@ struct ContentView: View {
                 // 只靠 padding 凑容易差 2pt，所以两边都写死高度。
                 HStack(spacing: 5) {
                     Image(systemName: "magnifyingglass")
-                        .font(.system(size: 11))
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                     SearchField(text: $ui.query)
                         .frame(width: 82)
@@ -234,6 +246,8 @@ struct ContentView: View {
         .padding(.bottom, 8)
         // 只让这一条的胶囊和搜索框做过渡，列表不参与
         .animation(.easeInOut(duration: 0.18), value: ui.tab)
+        // 换页签时键盘选中的行作废，免得按 ↓ 从上一个页签的位置开始数
+        .onChange(of: ui.tab) { ui.keyRow = nil }
     }
 
     private func segButton(_ label: String, index: Int) -> some View {
@@ -248,24 +262,54 @@ struct ContentView: View {
             // 玻璃轨道跟着一两个点地伸缩，切页签时看着就「晃」。锁住宽度最省事。
             ZStack {
                 Text(label)
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .opacity(0)
                 Text(label)
-                    .font(.system(size: 11.5, weight: selected ? .semibold : .regular))
+                    .font(.subheadline.weight(selected ? .semibold : .regular))
                     .foregroundStyle(selected ? Color.primary : Color.secondary)
             }
             .padding(.horizontal, 10)
             .frame(height: Self.barControlHeight - 6)   // 轨道上下各留 3pt
             .background {
-                if selected {
-                    Capsule()
-                        .fill(Color.primary.opacity(0.10))
-                        .overlay(Capsule().strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5))
+                // 只量位置，不画背景：胶囊统一由 tabPreview 画，才能在两格之间滑动
+                GeometryReader { proxy in
+                    Color.clear.preference(key: TabFrameKey.self,
+                                           value: [index: proxy.frame(in: .named("tabTrack"))])
                 }
             }
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
+        .onHover { inside in
+            if inside { ui.hoverTab = index }
+            else if ui.hoverTab == index { ui.hoverTab = nil }
+        }
+    }
+
+    /// 「提前选框」：选中的胶囊永远在原来的格子里，鼠标停到**另一格**时，
+    /// 那一格先浮出一层更淡的胶囊（预览），移开就消失。点下去才真正切过去。
+    /// 直接把唯一的胶囊滑到鼠标下面会让「已选中」看着像丢了，所以分成两层。
+    private var tabPreview: some View {
+        ZStack(alignment: .topLeading) {
+            if let f = ui.tabFrames[ui.tab] {
+                Capsule()
+                    .fill(Color.primary.opacity(0.10))
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.04), lineWidth: 0.5))
+                    .frame(width: f.width, height: f.height)
+                    .offset(x: f.minX, y: f.minY)
+            }
+            if let h = ui.hoverTab, h != ui.tab, let f = ui.tabFrames[h] {
+                Capsule()
+                    .fill(Color.primary.opacity(0.05))
+                    .overlay(Capsule().strokeBorder(Color.primary.opacity(0.03), lineWidth: 0.5))
+                    .frame(width: f.width, height: f.height)
+                    .offset(x: f.minX, y: f.minY)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.14), value: ui.hoverTab)
+        .animation(.easeInOut(duration: 0.18), value: ui.tab)
+        .allowsHitTesting(false)
     }
 
     // MARK: - 列表
@@ -320,6 +364,13 @@ struct ContentView: View {
                         if ui.expanded.isEmpty { scrollTop(proxy) }
                     }
                     .onPreferenceChange(RowFrameKey.self) { ui.rowFrames = $0 }
+                    // 键盘选中的行滚进视野中间；两个页签各滚各的
+                    .onChange(of: ui.keyRow) {
+                        guard let id = ui.keyRow else { return }
+                        withAnimation(.easeInOut(duration: 0.18)) {
+                            proxy.scrollTo(id, anchor: .center)
+                        }
+                    }
                     // 点开一行时，只有说明会长到面板外面才滚一下；本来整行就在视野里就不动，
                     // 免得点一下整页跳一格
                     .onChange(of: ui.expanded) {
@@ -348,6 +399,7 @@ struct ContentView: View {
                     hover: ui.hovers.box(for: row.id),
                     ignored: ignored,
                     expanded: ui.expanded.contains(row.id),
+                    focused: ui.keyRow == row.id,
                     onToggle: {
                         // 展开/收起也走动画，行高变化才不生硬
                         withAnimation(.easeInOut(duration: 0.16)) { ui.toggleExpanded(row.id) }
@@ -375,14 +427,15 @@ struct ContentView: View {
         } label: {
             HStack(spacing: 5) {
                 Image(systemName: "chevron.right")
-                    .font(.system(size: 8.5, weight: .bold))
+                    .font(.caption2.weight(.bold))
+                    .imageScale(.small)
                     .foregroundStyle(.tertiary)
                     .rotationEffect(.degrees(collapsed ? 0 : 90))
                 Text(group.title)
-                    .font(.system(size: 11, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Text("\(group.rows.count)")
-                    .font(.system(size: 10.5))
+                    .font(.footnote)
                     .monospacedDigit()
                     .foregroundStyle(.tertiary)
                 Spacer(minLength: 0)
@@ -401,10 +454,10 @@ struct ContentView: View {
         VStack(spacing: 6) {
             Spacer()
             Text(ui.tab == 0 ? "无更新" : "没有匹配的 App")
-                .font(.system(size: 21, weight: .semibold))
+                .font(.title.weight(.semibold))
                 .foregroundStyle(.primary)
             Text(ui.tab == 0 ? "所有 App 均为最新版本。" : "换个关键词试试")
-                .font(.system(size: 12))
+                .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
         }
@@ -419,7 +472,7 @@ struct ContentView: View {
                 !service.settings.ignored.contains($0.id) && !$0.hasSource
             }.count
             Text(unknown > 0 ? "\(unknown) 个 App 暂无自动检测源" : "所有 App 均有检测源")
-                .font(.system(size: 10))
+                .font(.footnote)
                 .foregroundStyle(.secondary)
 
             Spacer()
@@ -435,6 +488,14 @@ struct ContentView: View {
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+    }
+}
+
+/// 分段控件两格的几何，用偏好值从子视图传上来
+private struct TabFrameKey: PreferenceKey {
+    static var defaultValue: [Int: CGRect] = [:]
+    static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
+        value.merge(nextValue(), uniquingKeysWith: { $1 })
     }
 }
 
@@ -462,7 +523,7 @@ private struct GlassIcon: View {
     let systemName: String
     var body: some View {
         Image(systemName: systemName)
-            .font(.system(size: 12.5, weight: .medium))
+            .font(.callout.weight(.medium))
             .frame(width: 28, height: 28)
             .contentShape(Circle())
             .modifier(GlassCircle())
@@ -504,6 +565,7 @@ private struct SearchField: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SearchField
+        var focusObserver: NSObjectProtocol?
         init(_ parent: SearchField) { self.parent = parent }
 
         func controlTextDidChange(_ obj: Notification) {
@@ -533,7 +595,21 @@ private struct SearchField: NSViewRepresentable {
                          .foregroundColor: NSColor.secondaryLabelColor]
         )
         field.delegate = context.coordinator
+        // ⌘F 聚焦：面板由 AppDelegate 弹出后发通知，这里接住并把光标放进搜索框
+        context.coordinator.focusObserver = NotificationCenter.default.addObserver(
+            forName: .updateRadarFocusSearch, object: nil, queue: .main
+        ) { [weak field] _ in
+            guard let field, let window = field.window else { return }
+            window.makeFirstResponder(field)
+            field.currentEditor()?.selectAll(nil)
+        }
         return field
+    }
+
+    static func dismantleNSView(_ field: NSTextField, coordinator: Coordinator) {
+        if let token = coordinator.focusObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
@@ -575,6 +651,8 @@ struct RowView: View {
     var ignored: Bool = false
     /// 更新说明展开着没
     var expanded: Bool = false
+    /// 键盘选中的行（↑↓），画一层更实的底 + 焦点描边，和鼠标悬停区分开
+    var focused: Bool = false
     var onToggle: () -> Void = {}
 
     var body: some View {
@@ -594,11 +672,11 @@ struct RowView: View {
 
                         VStack(alignment: .leading, spacing: 1) {
                             Text(row.app.name)
-                                .font(.system(size: 13, weight: .semibold))
+                                .font(.body.weight(.semibold))
                                 .foregroundStyle(.primary)
                                 .lineLimit(1)
                             Text(row.subtitle)
-                                .font(.system(size: 10.5))
+                                .font(.footnote)
                                 .monospacedDigit()
                                 .foregroundStyle(.secondary)
                                 .lineLimit(1)
@@ -613,18 +691,22 @@ struct RowView: View {
 
                 // 右半：状态字 / 「更新」按钮
                 if ignored {
-                    Text("已忽略")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.tertiary)
-                        .contentShape(Rectangle())
-                        .onTapGesture { onToggle() }
+                    Button { onToggle() } label: {
+                        Text("已忽略")
+                            .font(.footnote)
+                            .foregroundStyle(.tertiary)
+                            .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 } else if row.isUpdate {
                     trailing
                 } else {
-                    // 已是最新 / 检测失败 / 无检测源：这几个只是字，点一下也能展开说明
-                    trailing
-                        .contentShape(Rectangle())
-                        .onTapGesture { onToggle() }
+                    // 已是最新 / 检测失败 / 无检测源：这几个只是字，点一下也能展开说明。
+                    // 用 Button 而不是 onTapGesture：VoiceOver 才认得出这是一个可点的目标。
+                    Button { onToggle() } label: {
+                        trailing.contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
                 }
             }
 
@@ -633,7 +715,7 @@ struct RowView: View {
                 notesBlock
             } else if let notes = row.result?.notes, !notes.isEmpty, row.isUpdate {
                 Text(notes)
-                    .font(.system(size: 10.5))
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.tail)
@@ -643,9 +725,24 @@ struct RowView: View {
         .padding(.leading, 12)
         .padding(.trailing, 18)
         .padding(.vertical, 8)
-        // 展开着的行留一层浅底，一眼能看出「这行是打开的」
-        .background(hover.on ? Color.primary.opacity(0.14)
-                    : (expanded ? Color.primary.opacity(0.05) : Color.clear))
+        // 悬停/展开的底色做成左右内缩的圆角块（访达、App Store、系统设置的列表都是这样），
+        // 不再铺满整行，行与行之间的分隔线就不会被色块顶掉。
+        // 颜色用系统语义色，深色模式、提高对比度时自动跟着变。
+        .background {
+            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                .fill(focused ? Color.accentColor.opacity(0.14)
+                      : hover.on ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor)
+                      : (expanded ? Color(nsColor: .unemphasizedSelectedContentBackgroundColor).opacity(0.5)
+                                  : Color.clear))
+                .overlay {
+                    if focused {
+                        RoundedRectangle(cornerRadius: 6, style: .continuous)
+                            .strokeBorder(Color.accentColor.opacity(0.55), lineWidth: 1)
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 1)
+        }
         .contentShape(Rectangle())
         .onHover { hover.on = $0 }
         .contextMenu {
@@ -689,13 +786,13 @@ struct RowView: View {
         VStack(alignment: .leading, spacing: 6) {
             if noteLines.isEmpty {
                 Text("这个 App 的更新源没带更新说明")
-                    .font(.system(size: 10.5))
+                    .font(.footnote)
                     .foregroundStyle(.tertiary)
             } else {
                 VStack(alignment: .leading, spacing: 3) {
                     ForEach(Array(noteLines.enumerated()), id: \.offset) { _, line in
                         Text(line)
-                            .font(.system(size: 10.5))
+                            .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
                     }
@@ -721,7 +818,7 @@ struct RowView: View {
     private func textButton(_ title: String, action: @escaping () -> Void) -> some View {
         Button(action: action) {
             Text(title)
-                .font(.system(size: 10.5, weight: .medium))
+                .font(.footnote.weight(.medium))
                 .foregroundStyle(Color.accentColor)
         }
         .buttonStyle(.plain)
@@ -730,7 +827,7 @@ struct RowView: View {
     /// 状态字只有这一处定义：「已是最新版本」和「检测失败」共用，字体永远一致
     private func statusText(_ text: String) -> some View {
         Text(text)
-            .font(.system(size: 10.5, weight: .semibold))
+            .font(.footnote.weight(.semibold))
             .foregroundStyle(.primary)
     }
 
@@ -745,7 +842,7 @@ struct RowView: View {
                 service.openUpdate(for: row)
             } label: {
                 Text("更新")
-                    .font(.system(size: 11.5, weight: .semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundStyle(.white)
                     .padding(.horizontal, 14)
                     .padding(.vertical, 4.5)
@@ -760,7 +857,8 @@ struct RowView: View {
             // 图标在前、字在后。图标沿用之前那一版：9pt 三角、不额外偏移。
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
-                    .font(.system(size: 9))
+                    .font(.caption2)
+                    .imageScale(.small)
                     .foregroundStyle(warnAmber)
                 statusText("检测失败")
             }
@@ -768,7 +866,7 @@ struct RowView: View {
             .help(row.result?.note ?? "检测失败")
         case .unknown:
             Text("无检测源")
-                .font(.system(size: 9.5))
+                .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
     }

@@ -14,8 +14,16 @@ final class UpdateService: ObservableObject {
 
     private var apps: [InstalledApp] = []
     private var results: [String: CheckResult] = [:]
-    private var timer: Timer?
+    private var scheduler: NSBackgroundActivityScheduler?
     private var didBootstrap = false
+    /// 扫描正在进行（防止连点「扫描」叠起来跑）
+    private var scanning = false
+    /// 监听 Applications 目录，装/卸 App 后自动重扫
+    private var watcher: AppDirWatcher?
+    /// 重扫防抖：一次安装会连着吐好几个 FSEvents
+    private var pendingRescan: DispatchWorkItem?
+    /// 结果重绘节流
+    private var pendingRebuild: DispatchWorkItem?
 
     // 真正的实现在 Models.swift 的 URSupportDir：Cask 枚举在并发 Task 里也要用它
     static let supportDir: URL = URSupportDir
@@ -31,24 +39,37 @@ final class UpdateService: ObservableObject {
     func bootstrap() {
         guard !didBootstrap else { return }
         didBootstrap = true
-        rescan()
-        scheduleTimer()
-        checkAll()
+        startWatchingApplications()
+        rescan(thenCheck: true)
+        scheduleAutoCheck()
     }
 
-    func rescan() {
-        apps = Scanner.scan()
-        // 只清「已卸载 App 的检测结果」，别动 ignored / dismissed：
-        // 外接盘拔掉、或某次扫描抖动时 App 会临时扫不到，一清就把用户
-        // 手动「忽略它 / 这个已经是最新」的记录抹了，下次又全冒出来。
-        let live = Set(apps.map(\.id))
-        let stale = results.keys.filter { !live.contains($0) }
-        if !stale.isEmpty {
-            for k in stale { results.removeValue(forKey: k) }
-            save()
+    /// 扫描放到后台队列：遍历 /Applications、逐个读 Info.plist 是磁盘密集操作，
+    /// 挂在主线程上会让面板在扫大目录时明显卡一下。
+    /// - Parameters:
+    ///   - thenCheck: 扫完是否接着检测一轮
+    ///   - force: 检测时是否忽略新鲜度（用户手动点「扫描」时用 true）
+    func rescan(thenCheck: Bool = false, force: Bool = false) {
+        guard !scanning else { return }
+        scanning = true
+        Task { [weak self] in
+            let found = await Task.detached(priority: .utility) { Scanner.scan() }.value
+            guard let self else { return }
+            self.scanning = false
+            self.apps = found
+            // 只清「已卸载 App 的检测结果」，别动 ignored / dismissed：
+            // 外接盘拔掉、或某次扫描抖动时 App 会临时扫不到，一清就把用户
+            // 手动「忽略它 / 这个已经是最新」的记录抹了，下次又全冒出来。
+            let live = Set(self.apps.map(\.id))
+            let stale = self.results.keys.filter { !live.contains($0) }
+            if !stale.isEmpty {
+                for k in stale { self.results.removeValue(forKey: k) }
+                self.save()
+            }
+            self.appCount = self.apps.count
+            self.rebuild()
+            if thenCheck { self.checkAll(force: force) }
         }
-        appCount = apps.count
-        rebuild()
     }
 
     // MARK: - 检测
@@ -64,7 +85,11 @@ final class UpdateService: ObservableObject {
     ///   不用把 136 个 App 全跑一遍）
     func checkAll(force: Bool = false, only: Set<String>? = nil) {
         guard !checking else { return }
-        if apps.isEmpty { rescan() }
+        // 还没扫到 App：先扫，扫完自动接着查这一轮，别在这里空转
+        guard !apps.isEmpty else {
+            rescan(thenCheck: true, force: force)
+            return
+        }
 
         // 这里用的是 settings.intervalHours：每 6 小时检查一次，就不会每 6 小时里反复查
         let ttl = max(0.25, settings.intervalHours) * 3600
@@ -112,9 +137,10 @@ final class UpdateService: ObservableObject {
                         inFlight += 1
                     }
                     self.progress = Double(done) / total
-                    if done % 4 == 0 || done == targets.count { self.rebuild() }
+                    self.scheduleRebuild()
                 }
             }
+            self.flushRebuild()
             self.settings.lastCheck = Date()
             self.lastCheck = self.settings.lastCheck
             self.checking = false
@@ -137,7 +163,49 @@ final class UpdateService: ObservableObject {
         return 0
     }
 
+    // MARK: - 目录监听
+
+    private func startWatchingApplications() {
+        guard watcher == nil else { return }
+        let home = NSHomeDirectory()
+        let paths = ["/Applications", home + "/Applications"]
+            .filter { FileManager.default.fileExists(atPath: $0) }
+        watcher = AppDirWatcher(paths: paths) { [weak self] in
+            // FSEvents 回调在它自己的队列上，跳回主线程再动状态
+            Task { @MainActor in self?.scheduleRescanFromDisk() }
+        }
+    }
+
+    private func scheduleRescanFromDisk() {
+        pendingRescan?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.pendingRescan = nil
+            self?.rescan()
+        }
+        pendingRescan = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
+    }
+
     // MARK: - 数据整合
+
+    /// 结果一条条回来时合并重绘：以前每 4 个结果就整表重建 + 排序 + 切组，
+    /// 136 个 App 会重建三十多次，扫描期间列表一直在重排。
+    private func scheduleRebuild() {
+        guard pendingRebuild == nil else { return }
+        let work = DispatchWorkItem { [weak self] in
+            self?.pendingRebuild = nil
+            self?.rebuild()
+        }
+        pendingRebuild = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: work)
+    }
+
+    /// 一轮查完：立刻用最终结果重建一次，不等节流
+    private func flushRebuild() {
+        pendingRebuild?.cancel()
+        pendingRebuild = nil
+        rebuild()
+    }
 
     private func rebuild() {
         rows = apps.map { app in
@@ -180,7 +248,7 @@ final class UpdateService: ObservableObject {
 
     func setInterval(_ hours: Double) {
         settings.intervalHours = hours
-        scheduleTimer()
+        scheduleAutoCheck()
         save()
     }
 
@@ -266,13 +334,22 @@ final class UpdateService: ObservableObject {
         Notifier.shared.post(title: "\(updates.count) 个 App 有新版本", body: body, id: "updates")
     }
 
-    private func scheduleTimer() {
-        timer?.invalidate()
-        let t = Timer(timeInterval: max(0.25, settings.intervalHours) * 3600, repeats: true) { [weak self] _ in
+    /// 后台定时检测。用 NSBackgroundActivityScheduler 而不是 Timer：
+    /// 它能感知睡眠、低电量、系统忙闲，唤醒时间由系统合并；
+    /// 合盖一夜之后 Timer 攒下的到期事件会一次性全炸出来，它不会。
+    private func scheduleAutoCheck() {
+        scheduler?.invalidate()
+        let s = NSBackgroundActivityScheduler(identifier: "com.hushixiong.updateradar.autocheck")
+        s.repeats = true
+        s.interval = max(0.25, settings.intervalHours) * 3600
+        // 10 分钟内浮动，让系统挑它觉得合适的时间，别整点扎堆
+        s.tolerance = s.interval * 0.1
+        s.qualityOfService = .utility
+        s.schedule { [weak self] completion in
             Task { @MainActor in self?.checkAll() }
+            completion(.finished)
         }
-        RunLoop.main.add(t, forMode: .common)
-        timer = t
+        scheduler = s
     }
 
     // MARK: - 持久化
@@ -327,5 +404,49 @@ final class UpdateService: ObservableObject {
 
     func launch(_ app: InstalledApp) {
         NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
+    }
+}
+
+/// 监听 Applications 目录：装、卸、改名之后自动重扫，不用用户手动点「扫描」。
+/// 用 FSEvents 而不是轮询：系统本来就在为 Finder/Spotlight 收集这些事件，
+/// 对常驻的菜单栏 App 几乎没有额外开销；只监听顶层目录变化，不追 .app 内部文件。
+private final class AppDirWatcher {
+    private let onChange: () -> Void
+    private var stream: FSEventStreamRef?
+
+    init(paths: [String], onChange: @escaping () -> Void) {
+        self.onChange = onChange
+        guard !paths.isEmpty else { return }
+
+        let callback: FSEventStreamCallback = { _, info, _, _, _, _ in
+            guard let info else { return }
+            Unmanaged<AppDirWatcher>.fromOpaque(info).takeUnretainedValue().onChange()
+        }
+        var context = FSEventStreamContext(
+            version: 0,
+            info: Unmanaged.passUnretained(self).toOpaque(),
+            retain: nil, release: nil, copyDescription: nil
+        )
+        stream = FSEventStreamCreate(
+            kCFAllocatorDefault, callback, &context,
+            paths as CFArray,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            1.0,
+            UInt32(kFSEventStreamCreateFlagWatchRoot)
+        )
+        guard let stream else { return }
+        FSEventStreamSetDispatchQueue(stream, DispatchQueue(label: "com.hushixiong.updateradar.appwatch"))
+        if !FSEventStreamStart(stream) {
+            // 起不来就当作没监听：扫描按钮照常可用，不影响主要功能
+            FSEventStreamInvalidate(stream)
+            self.stream = nil
+        }
+    }
+
+    deinit {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        // FSEventStreamCreate 的返回值由 ARC 持有，这里不再手动 Release
     }
 }

@@ -14,7 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cancellable: AnyCancellable?
     private var bobCancellable: AnyCancellable?
     private var settingsCancellable: AnyCancellable?
-    private var selfCheckTimer: Timer?
+    private var selfCheckScheduler: NSBackgroundActivityScheduler?
+    /// 面板开着时的键盘监听（↑↓ / Return）；只有面板是 key window 才接管
+    private var keyMonitor: Any?
 
     // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
     // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
@@ -46,7 +48,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             forName: NSPopover.didCloseNotification, object: nil, queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.updateBadge() }
+            Task { @MainActor in
+                self?.removePanelKeyMonitor()
+                self?.updateBadge()
+            }
         }
 
         Notifier.shared.setup()
@@ -89,10 +94,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
             self?.updater.checkIfStale()
         }
-        selfCheckTimer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+        // 同样交给 NSBackgroundActivityScheduler：24 小时是大周期，
+        // 更需要系统根据睡眠/电量来挑时间，而不是开机时挂一个死循环 Timer。
+        let selfCheck = NSBackgroundActivityScheduler(identifier: "com.hushixiong.updateradar.selfcheck")
+        selfCheck.repeats = true
+        selfCheck.interval = 24 * 3600
+        selfCheck.tolerance = 2 * 3600
+        selfCheck.qualityOfService = .utility
+        selfCheck.schedule { [weak self] completion in
             Task { @MainActor in self?.updater.check() }
+            completion(.finished)
         }
+        selfCheckScheduler = selfCheck
 
+        applyDebugEnvironment()
+    }
+
+    /// 调试用的环境变量开关。抽出来集中放一处，`applicationDidFinishLaunching` 只负责启动顺序。
+    /// 这些开关只在从终端手动启动时生效，正常双击打开时全部为空。
+    private func applyDebugEnvironment() {
         let env = ProcessInfo.processInfo.environment
         if env["UPDATERADAR_FORCE_DARK"] != nil { NSApp.appearance = NSAppearance(named: .darkAqua) }
         if env["UPDATERADAR_FORCE_LIGHT"] != nil { NSApp.appearance = NSAppearance(named: .aqua) }
@@ -184,20 +204,118 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         appItem.submenu = appMenu
         main.addItem(appItem)
 
+        // 编辑菜单：文本编辑快捷键必须有菜单项挂载，否则 LSUIElement 应用里
+        // ⌘C / ⌘V / ⌘A 在搜索框里全部失效。target 留空，走响应链找第一响应者。
+        let editItem = NSMenuItem()
+        let editMenu = NSMenu(title: "编辑")
+        editMenu.addItem(withTitle: "撤销", action: Selector(("undo:")), keyEquivalent: "z")
+        let redo = NSMenuItem(title: "重做", action: Selector(("redo:")), keyEquivalent: "z")
+        redo.keyEquivalentModifierMask = [.command, .shift]
+        editMenu.addItem(redo)
+        editMenu.addItem(.separator())
+        editMenu.addItem(withTitle: "剪切", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(withTitle: "删除", action: NSSelectorFromString("delete:"), keyEquivalent: "")
+        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        editMenu.addItem(.separator())
+        let find = NSMenuItem(title: "搜索", action: #selector(focusSearch), keyEquivalent: "f")
+        find.target = self
+        editMenu.addItem(find)
+        editItem.submenu = editMenu
+        main.addItem(editItem)
+
+        let viewItem = NSMenuItem()
+        let viewMenu = NSMenu(title: "显示")
+        let rescanItem = NSMenuItem(title: "重新扫描", action: #selector(rescanFromMenu), keyEquivalent: "r")
+        rescanItem.target = self
+        viewMenu.addItem(rescanItem)
+        viewItem.submenu = viewMenu
+        main.addItem(viewItem)
+
         NSApp.mainMenu = main
     }
 
     @objc private func openSettingsFromMenu() { showSettings() }
+
+    /// ⌘F：面板没开就先弹出来，再把焦点交给搜索框
+    @objc private func focusSearch() {
+        if popover?.isShown != true { showPanel() }
+        // 面板刚弹出时 SwiftUI 还没把搜索框建出来，等一拍再发
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            NotificationCenter.default.post(name: .updateRadarFocusSearch, object: nil)
+        }
+    }
+
+    @objc private func rescanFromMenu() { service.rescan() }
 
     private func showPanel() {
         guard let popover, !popover.isShown, let button = statusItem.button else { return }
         button.toolTip = nil
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        installPanelKeyMonitor()
     }
 
     private func hidePanel() {
         popover?.performClose(nil)
+    }
+
+    // MARK: - 面板键盘
+
+    /// 只挂本地监视器：面板是 key window 时接管 ↑↓ / Return，其它情况原样放行。
+    /// 用 Esc 关面板交给 NSPopover 自己（transient 弹层默认就支持）。
+    private func installPanelKeyMonitor() {
+        guard keyMonitor == nil else { return }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self else { return event }
+            // 只把 keyCode 带进主线程，NSEvent 本身不是 Sendable
+            let code = event.keyCode
+            let handled = MainActor.assumeIsolated { self.handlePanelKey(code: code) }
+            return handled ? nil : event
+        }
+    }
+
+    private func removePanelKeyMonitor() {
+        if let keyMonitor {
+            NSEvent.removeMonitor(keyMonitor)
+            self.keyMonitor = nil
+        }
+    }
+
+    /// 返回 true 表示这枚按键已经吃掉，false 表示原样放行
+    private func handlePanelKey(code: UInt16) -> Bool {
+        guard let popover, popover.isShown,
+              let window = popover.contentViewController?.view.window,
+              window.isKeyWindow else { return false }
+        // 正在搜索框里打字：方向键要移光标、Return 什么也别做
+        if window.firstResponder is NSTextView { return false }
+        switch code {
+        case 126: moveKeyRow(-1); return true      // ↑
+        case 125: moveKeyRow(1); return true       // ↓
+        case 36, 76: activateKeyRow(); return true // Return / 小键盘 Enter
+        default: return false
+        }
+    }
+
+    /// 行的顺序直接从布局里读：rowFrames 是按纵坐标记的，折叠、分组、换页签都不用另外算
+    private func moveKeyRow(_ delta: Int) {
+        let ids = ui.rowFrames.sorted { $0.value.minY < $1.value.minY }.map(\.key)
+        guard !ids.isEmpty else { return }
+        let current = ui.keyRow.flatMap { ids.firstIndex(of: $0) }
+        let start = current ?? (delta > 0 ? -1 : ids.count)
+        let next = min(max(start + delta, 0), ids.count - 1)
+        ui.keyRow = ids[next]
+    }
+
+    /// Return：有新版本就去下载页；其它行在 Finder 中显示
+    private func activateKeyRow() {
+        guard let id = ui.keyRow, let row = service.rows.first(where: { $0.id == id }) else { return }
+        if row.isUpdate {
+            service.openUpdate(for: row)
+        } else {
+            service.reveal(row.app)
+        }
     }
 
     /// 把面板离屏渲染成 PNG，用于截图核对界面（锁屏也照样能出图）
@@ -342,9 +460,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/UpdateRadarMenuBar.svg）：
         // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
         //
-        // 尺寸：SVG 的外框是 22，圆环只占 17.2/22；按 22pt 画出来圆环才是 17.2pt，
-        // 跟旧版自绘（18pt 框、环 ≈17.4pt）视觉一样大。改成 18pt 会明显小一圈。
-        let assetSide: CGFloat = 22
+        // 尺寸：SVG 的外框是 22，圆环只占 17.2/22。按 20.5pt 画出来圆环是 16pt，
+        // 跟 Wi‑Fi、电池这类系统图标并排时高度一致；按 22pt 画会高出一头。
+        let assetSide: CGFloat = 20.5
         if let asset = NSImage(named: "UpdateRadarMenuBar")?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
@@ -437,34 +555,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func showAbout() { aboutController.show() }
 
-    @objc private func setInterval(_ sender: NSMenuItem) {
-        guard let hours = sender.representedObject as? Double else { return }
-        service.setInterval(hours)
-    }
-
-    @objc private func toggleHideUnknown() { service.setHideUnknown(!service.settings.hideUnknown) }
-    @objc private func toggleNotify() { service.setNotify(!service.settings.notifyEnabled) }
-    @objc private func toggleShowCount() {
-        service.setShowCount(!service.settings.countVisible)
-        updateBadge()
-    }
-
-    @objc private func openDataFolder() { NSWorkspace.shared.open(UpdateService.supportDir) }
-
-    @objc private func openNotificationSettings() {
-        if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
-            NSWorkspace.shared.open(url)
-        }
-    }
-
     @objc private func checkNow() {
-        service.rescan()
-        service.checkAll(force: true)
+        service.rescan(thenCheck: true, force: true)
     }
 
     @objc private func quitApp() { NSApp.terminate(nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// 系统会调用它来确认「关掉窗口后能不能安全恢复状态」。我们只有菜单栏面板和两个窗口，
+    /// 全部由 AppKit 恢复，直接返回 true；否则日志里一直有一条告警。
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool { true }
 }
 
 MainActor.assumeIsolated {

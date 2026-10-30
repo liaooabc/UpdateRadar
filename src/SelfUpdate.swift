@@ -24,6 +24,8 @@ final class SelfUpdater: ObservableObject {
 
     @Published private(set) var phase: Phase = .idle
     private var lastChecked: Date?
+    /// 这次「有新版本」对应的 DMG 校验和（GitHub Release 的 assets[].digest，形如 sha256:…）
+    private var pendingDigest: String?
 
     var currentVersion: String {
         // 调试用：UPDATERADAR_FAKE_VERSION=1.0.9 假装本机是旧版，看「有新版本」那一行长什么样
@@ -75,12 +77,14 @@ final class SelfUpdater: ObservableObject {
                 let dmg = assets.first { (($0["name"] as? String) ?? "").lowercased().hasSuffix(".dmg") }
 
                 if Ver.isNewer(latest, than: self.currentVersion) {
+                    self.pendingDigest = dmg?["digest"] as? String
                     self.phase = .available(version: latest,
                                             downloadURL: (dmg?["browser_download_url"] as? String) ?? page,
                                             pageURL: page,
                                             hasDMG: dmg != nil)
                     Debug.autoInstallIfRequested(self)
                 } else {
+                    self.pendingDigest = nil
                     self.phase = .upToDate(latest)
                 }
             }
@@ -89,7 +93,7 @@ final class SelfUpdater: ObservableObject {
 
     private func maybeAutoInstall() {
         if case let .available(version, url, _, hasDMG) = phase, hasDMG {
-            install(version: version, downloadURL: url)
+            install(version: version, downloadURL: url, digest: pendingDigest)
         }
     }
 
@@ -104,8 +108,9 @@ final class SelfUpdater: ObservableObject {
 
     // MARK: - 安装
 
-    /// 用户点「更新并重启」：下载 → 挂载校验 → 暂存 → 交给脚本替换 → 退出
-    func install(version: String, downloadURL: String) {
+    /// 用户点「更新并重启」：下载 → 校验 → 挂载校验 → 暂存 → 交给脚本替换 → 退出
+    /// - Parameter digest: release 里公布的 SHA256（可选）；有就核对下载文件的哈希
+    func install(version: String, downloadURL: String, digest: String? = nil) {
         guard !isBusy else { return }
         phase = .downloading(version: version, progress: 0)
 
@@ -119,6 +124,7 @@ final class SelfUpdater: ObservableObject {
                         }
                     }
                 }
+                if let digest { try Self.verifyDigest(dmg, expected: digest) }
                 self.phase = .installing(version: version)
                 try self.stageAndHandOff(dmg: dmg, expectedVersion: version)
                 // 脚本在等本进程退出，给它一点时间接手再退
@@ -172,6 +178,7 @@ final class SelfUpdater: ObservableObject {
         try fm.createDirectory(at: stagingDir, withIntermediateDirectories: true)
         let staging = stagingDir.appendingPathComponent("更新雷达.app")
         try Self.run("/usr/bin/ditto", [newApp.path, staging.path])
+        try Self.verifySignature(of: staging)
         try? fm.removeItem(at: dmg)
 
         // 替换脚本：等本进程退出 → 备份 → 放新包 → 重新打开；任何一步失败都回滚并重新打开旧的
@@ -193,6 +200,7 @@ final class SelfUpdater: ObservableObject {
           exit 1
         fi
         if /usr/bin/ditto "$NEW" "$APP"; then
+          # 签名和哈希已在主进程校验过；这里只清掉从 DMG 带来的 quarantine 标记
           /usr/bin/xattr -dr com.apple.quarantine "$APP" 2>/dev/null
           /usr/bin/open "$APP"
           /bin/rm -rf "$BACKUP" "$NEW"
@@ -210,6 +218,42 @@ final class SelfUpdater: ObservableObject {
         process.executableURL = URL(fileURLWithPath: "/bin/bash")
         process.arguments = [script.path, runningApp.path, staging.path, backup.path, String(ProcessInfo.processInfo.processIdentifier)]
         try process.run()
+    }
+
+    // MARK: - 校验
+
+    /// 核对下载包的 SHA256（GitHub Release 的 asset digest）。
+    /// 能挡下「下载被截断 / CDN 缓存坏了 / 半路被替换」。
+    private static func verifyDigest(_ file: URL, expected: String) throws {
+        let hex = expected.lowercased().hasPrefix("sha256:") ? String(expected.dropFirst(7)) : expected
+        // 用系统的 shasum：DMG 十几到几十兆，流式读一遍就够，不想为此多引一个框架
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/shasum")
+        process.arguments = ["-a", "256", file.path]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            throw UpdateError("算不出安装包的哈希，已中止。")
+        }
+        let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let actual = text.split(separator: " ").first.map(String.init)?.lowercased() ?? ""
+        guard actual == hex.lowercased() else {
+            throw UpdateError("安装包校验和对不上（可能下载损坏或被替换），已中止。")
+        }
+    }
+
+    /// 签名自洽性校验。说清楚它能干什么、不能干什么：
+    /// 能证明包是完整的、签名与内容一致；**证明不了发布者是谁**——本项目是 ad-hoc 签名，
+    /// 没有 Team ID。要证明身份需要 Developer ID + 公证，或改用 Sparkle 的 EdDSA 签名。
+    private static func verifySignature(of app: URL) throws {
+        do {
+            try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        } catch {
+            throw UpdateError("下载的 App 没通过签名校验，已中止。（\(error.localizedDescription)）")
+        }
     }
 
     // MARK: - 下载
