@@ -6,6 +6,10 @@ private let warnAmber = Color.orange
 extension Notification.Name {
     /// ⌘F：菜单栏点「搜索」后，让搜索框成为第一响应者
     static let updateRadarFocusSearch = Notification.Name("UpdateRadarFocusSearch")
+    /// 从外面改写搜索框内容（点清除按钮、点最近搜索里的一条）。
+    /// 必须走通知：NSTextField 正在编辑时，SwiftUI 的 binding 回写到不了编辑器里，
+    /// 不清掉编辑器里的字，界面就会和 ui.query 对不上。
+    static let updateRadarSetSearch = Notification.Name("UpdateRadarSetSearch")
 }
 
 /// 界面自身的小状态。用 ObservableObject 而不是 @State，因为这台机器只有
@@ -30,6 +34,36 @@ final class UIState: ObservableObject {
     @Published var keyRow: String?
     /// 每一行在列表可视区里的位置（不发布，只给「要不要滚」用，避免滚动时反复重绘）
     var rowFrames: [String: CGRect] = [:]
+
+    /// 搜索框是不是正在编辑：决定要不要把「最近搜索」列出来
+    @Published var searchActive = false
+    /// 最近搜索过的关键词，最新的在前，最多 5 条
+    @Published var recentSearches: [String] =
+        UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+
+    private static let recentKey = "recentSearches"
+    private static let recentLimit = 5
+
+    /// 回车时记一条。已经搜过的词再搜一次会挪到最前面，不重复占位。
+    func commitSearch(_ raw: String) {
+        let word = raw.trimmingCharacters(in: .whitespaces)
+        guard !word.isEmpty else { return }
+        var list = recentSearches.filter { $0.caseInsensitiveCompare(word) != .orderedSame }
+        list.insert(word, at: 0)
+        recentSearches = Array(list.prefix(Self.recentLimit))
+        UserDefaults.standard.set(recentSearches, forKey: Self.recentKey)
+    }
+
+    func clearRecentSearches() {
+        recentSearches = []
+        UserDefaults.standard.removeObject(forKey: Self.recentKey)
+    }
+
+    /// 用一条历史记录（或空串）改写搜索框，并让输入框继续拿着焦点
+    func applySearch(_ word: String) {
+        query = word
+        NotificationCenter.default.post(name: .updateRadarSetSearch, object: word)
+    }
 
     func toggleExpanded(_ id: String) {
         // 注意：这里必须整体赋值。对 @Published 的 Set 调 insert/remove 是原地改，
@@ -132,79 +166,24 @@ struct ContentView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            header
-            if service.checking {
-                ProgressView(value: service.progress)
-                    .progressViewStyle(.linear)
-                    .controlSize(.small)
-                    .padding(.horizontal, 14)
-                    .padding(.bottom, 6)
-            }
-            tabBar
-            Divider().opacity(0.5)
-            list
-            Divider().opacity(0.5)
-            footer
-        }
-        .frame(width: 364, height: 548)
+        // 顶部条和底栏不再作为"占位"排在列表上下，而是挂成列表的安全区内嵌：
+        // 行能从条底下穿过去，条自己那层 ultraThinMaterial 把穿过的那几行糊掉，
+        // 再叠上 macOS 26 的滚动边缘效果，滑到边上的内容就有一段渐隐，这就是透视感。
+        // 老系统没有那条系统 API，纯靠材质兜底，效果弱一点但不会破。
+        list
+            .safeAreaInset(edge: .top, spacing: 0) { topBar }
+            .safeAreaInset(edge: .bottom, spacing: 0) { footer }
+            .frame(width: 364, height: 548)
         // 不铺不透明底色：让 NSPopover 自己的液态玻璃材质透过来
     }
 
-    // MARK: - 头部
-
-    private var header: some View {
-        HStack(alignment: .top, spacing: 10) {
-            VStack(alignment: .leading, spacing: 3) {
-                Text(titleText)
-                    .font(.title3.weight(.semibold))
-                    .foregroundStyle(.primary)
-                Text(subtitleText)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-            }
-            Spacer()
-            // 这颗按钮写文字而不是画个转圈箭头：12pt 的箭头缩在玻璃圆里认不出是在干嘛，
-            // 而且字形一粗就像个噪点。文字胶囊跟分段控件同一种形状、同一种玻璃。
-            Button {
-                service.rescan(thenCheck: true, force: true)
-            } label: {
-                Text("扫描")
-                    .font(.subheadline.weight(.medium))
-                    .padding(.horizontal, 11)
-                    .frame(height: 26)
-                    .contentShape(Capsule())
-                    .modifier(GlassPill())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(service.checking ? Color.secondary : Color.primary)
-            .disabled(service.checking)
-            .help("立即扫描")
-        }
-        .padding(.horizontal, 14)
-        .padding(.top, 14)
-        .padding(.bottom, 10)
-    }
-
-    private var titleText: String {
-        if service.checking && service.updateCount == 0 && service.lastCheck == nil {
-            return "正在检测…"
-        }
-        if service.updateCount == 0 { return "全部都是最新的" }
-        return "\(service.updateCount) 个 App 有新版本"
-    }
-
-    private var subtitleText: String {
-        let time: String
-        if let d = service.lastCheck {
-            let f = DateFormatter()
-            f.dateFormat = "HH:mm"
-            time = "上次检测 \(f.string(from: d))"
-        } else {
-            time = "还没有检测过"
-        }
-        let checking = service.checking ? " · 正在检测" : ""
-        return "\(time) · 共 \(service.appCount) 个 App\(checking)"
+    private var topBar: some View {
+        // 扫描中不再显示进度条：试过三种做法（直接绑值、SwiftUI 补间、Core Animation），
+        // 弹层里都换不来"匀速"，反而更卡。进度改成由底栏那颗扫描图标转圈表示。
+        tabBar
+        // 这里故意不再垫 .ultraThinMaterial：弹层本身已经是系统液态玻璃，
+        // 再叠一层材质就是"玻璃上贴磨砂膜"，越叠越不透，透明度也不跟系统设置了。
+        // 边缘那层糊化交给 ScrollEdgeBlur 的系统边缘效果，只留一层玻璃。
     }
 
     // MARK: - 分段
@@ -227,27 +206,94 @@ struct ContentView: View {
 
             Spacer(minLength: 0)
 
-            if ui.tab == 1 {
-                // 尺寸/字号必须跟左边那条轨道一模一样：同一个高度、同一个 11.5 号字，
-                // 只靠 padding 凑容易差 2pt，所以两边都写死高度。
-                HStack(spacing: 5) {
-                    Image(systemName: "magnifyingglass")
+            // 搜索框常驻：原来只在「其他」页签出现，切到「可更新」就消失，
+            // 想搜个名字还得先换页。现在两个页签下都在，⌘F 也随时能落到它上面。
+            // 尺寸/字号必须跟左边那条轨道一模一样：同一个高度、同一个正文字号，
+            // 只靠 padding 凑容易差 2pt，所以两边都写死高度。
+            HStack(spacing: 5) {
+                Image(systemName: "magnifyingglass")
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                SearchField(ui: ui)
+                    .frame(width: 64)
+                // 清除按钮的位置常驻（没字的时候只是透明）：一出现一消失，
+                // 整条胶囊的宽度就会跟着跳一下，段落轨道也会跟着挤。
+                Button {
+                    ui.applySearch("")
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
-                    SearchField(text: $ui.query)
-                        .frame(width: 82)
                 }
-                .padding(.horizontal, 10)
-                .frame(height: Self.barControlHeight)
-                .modifier(GlassSearchField())
+                .buttonStyle(.plain)
+                .opacity(ui.query.isEmpty ? 0 : 1)
+                .disabled(ui.query.isEmpty)
+                .help("清除搜索")
             }
+            .padding(.horizontal, 10)
+            .frame(height: Self.barControlHeight)
+            .modifier(GlassSearchField())
         }
         .padding(.horizontal, 14)
+        .padding(.top, 12)
         .padding(.bottom, 8)
+        // 最近搜索：贴在搜索框正下方，只在「正在搜索、还没打字、有历史」时出现
+        .overlay(alignment: .topTrailing) {
+            if ui.searchActive, ui.query.isEmpty, !ui.recentSearches.isEmpty {
+                recentSearchesPanel
+                    .padding(.trailing, 14)
+                    .offset(y: Self.barControlHeight + 18)
+            }
+        }
         // 只让这一条的胶囊和搜索框做过渡，列表不参与
         .animation(.easeInOut(duration: 0.18), value: ui.tab)
         // 换页签时键盘选中的行作废，免得按 ↓ 从上一个页签的位置开始数
         .onChange(of: ui.tab) { ui.keyRow = nil }
+    }
+
+    /// 搜索框下面的「最近搜索」浮层。宽度比搜索框宽一些，右边缘与搜索框对齐。
+    private var recentSearchesPanel: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: 8) {
+                Text("最近搜索")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                Spacer(minLength: 8)
+                Button("清除") { ui.clearRecentSearches() }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .buttonStyle(.plain)
+                    .help("清空最近搜索")
+            }
+            .padding(.horizontal, 11)
+            .padding(.top, 9)
+            .padding(.bottom, 5)
+
+            ForEach(ui.recentSearches, id: \.self) { word in
+                Button {
+                    ui.applySearch(word)
+                } label: {
+                    HStack(spacing: 7) {
+                        Image(systemName: "clock.arrow.circlepath")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                        Text(word)
+                            .font(.body)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(.horizontal, 11)
+                    .padding(.vertical, 5)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(PressablePlainButton())
+            }
+        }
+        .frame(width: 210)
+        .padding(.bottom, 7)
+        .modifier(GlassCard())
+        .zIndex(2)
     }
 
     private func segButton(_ label: String, index: Int) -> some View {
@@ -383,6 +429,9 @@ struct ContentView: View {
                             }
                         }
                     }
+                    // 系统的滚动边缘效果：滑到顶/底时，被条遮住的那一段由系统做渐隐，
+                    // 不是我们自己画的渐变，所以深浅色、壁纸、透明度都跟系统一致。
+                    .modifier(ScrollEdgeBlur())
                 }
                 }
                 .coordinateSpace(name: "urList")
@@ -467,27 +516,43 @@ struct ContentView: View {
     // MARK: - 底栏
 
     private var footer: some View {
+        // 底栏只留两颗按钮。原来那句「共 N 个 App · N 个暂无检测源 · 18:47 检测」删了：
+        // 底栏现在是透明的，行要从底下穿过去，文字压在上面翻来翻去永远看不清。
+        // 这三样信息也都有正经去处——App 总数看两个页签的数字，无检测源的条数在「其他」
+        // 页里就是一个分组，上次检测时间在设置窗口「上次检测」那一行。
+        // Apple 自己的弹层底部也很少放状态文字，留一排控件更干净。
         HStack(spacing: 8) {
-            let unknown = service.rows.filter {
-                !service.settings.ignored.contains($0.id) && !$0.hasSource
-            }.count
-            Text(unknown > 0 ? "\(unknown) 个 App 暂无自动检测源" : "所有 App 均有检测源")
-                .font(.footnote)
-                .foregroundStyle(.secondary)
-
             Spacer()
 
-            // 齿轮不再弹一长串菜单，直接打开设置窗口：
-            // 面板只有 364pt 宽，七八项设置塞进菜单里既挤又难找。
-            Button(action: onOpenSettings) {
-                GlassIcon(systemName: "gearshape")
+            footerButton("arrow.triangle.2.circlepath",
+                         spinning: service.checking,
+                         help: service.checking ? "正在扫描" : "立即扫描") {
+                service.rescan(thenCheck: true, force: true)
             }
-            .buttonStyle(.plain)
-            .help("设置")
-            .fixedSize()
+            .disabled(service.checking)
+
+            footerButton("gearshape", help: "设置") { onOpenSettings() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
+        // 同样不垫材质：底栏靠弹层自己的玻璃 + 系统边缘效果，
+        // 这样"降低透明度 / 增强对比度"这些辅助功能设置才会原样作用到这一条上。
+    }
+
+    /// 底栏按钮：还是之前那两颗 28pt 玻璃圆（GlassIcon）。
+    /// 玻璃本身仍然交给系统（glassEffect），但我们不加任何额外材质、底色或描边，
+    /// 透明度完全由系统决定，这样「降低透明度 / 增强对比度」会原样作用在它们身上。
+    /// 上一版换成的 .glass 按钮样式圆角和高光跟这两个不一样，看着不统一，已退回。
+    @ViewBuilder
+    private func footerButton(_ systemName: String,
+                              spinning: Bool = false,
+                              help: String,
+                              action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            GlassIcon(systemName: systemName, spinning: spinning)
+        }
+        .buttonStyle(.plain)
+        .help(help)
     }
 }
 
@@ -500,6 +565,19 @@ private struct TabFrameKey: PreferenceKey {
 }
 
 // MARK: - 玻璃
+
+/// 列表的滚动边缘效果（macOS 26 的液态玻璃）：内容滑到被顶部条 / 底栏遮住的那一段时，
+/// 由系统做一层渐进模糊 + 淡出，不是我们自己画渐变，所以深浅色和透明度都跟系统一致。
+/// 老系统没有这个 API，就什么都不加——那时靠条自己的 ultraThinMaterial 兜住。
+private struct ScrollEdgeBlur: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+        } else {
+            content
+        }
+    }
+}
 
 /// 真·液态玻璃：macOS 26 起系统提供 `.glassEffect`，材质、折射、边缘高光全由系统画。
 /// 自己叠 material + 描边 + 投影只能做出"磨砂塑料"，这就是前面那版不像的原因。
@@ -516,17 +594,47 @@ private struct GlassTrack: ViewModifier {
     }
 }
 
-/// 圆形玻璃图标（刷新 / 设置齿轮共用）：同一个 28pt 圆、同一套玻璃材质。
+/// 圆形玻璃图标（扫描 / 设置齿轮共用）：同一个 28pt 圆、同一套玻璃材质。
 /// 玻璃必须画在 label **里面**——Menu 的 borderlessButton 会自己接管外层背景，
 /// 加在 Menu 外面的 glassEffect 完全不会出现（齿轮之前就是一坨平面图标的原因）。
 private struct GlassIcon: View {
     let systemName: String
+    /// 扫描中：换成系统自带的转圈进度指示器
+    var spinning: Bool = false
+
     var body: some View {
-        Image(systemName: systemName)
-            .font(.callout.weight(.medium))
-            .frame(width: 28, height: 28)
-            .contentShape(Circle())
-            .modifier(GlassCircle())
+        Group {
+            if spinning {
+                NativeSpinner()
+                    .allowsHitTesting(false)
+            } else {
+                Image(systemName: systemName)
+                    .font(.callout.weight(.medium))
+            }
+        }
+        .frame(width: 28, height: 28)
+        .contentShape(Circle())
+        .modifier(GlassCircle())
+    }
+}
+
+/// 系统自己的不确定进度指示器（NSProgressIndicator 的 spinning 样式）。
+/// 之前是想让箭头符号自己转：可箭头是方块状的字形，转起来按对角线扫，
+/// 角尖必然扫出圆框；缩小字号又跟旁边的齿轮不一样大。转圈这件事交给系统，
+/// 尺寸、转速、透明度（包括"降低动态效果"）都由它按自身设置来。
+private struct NativeSpinner: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSProgressIndicator {
+        let indicator = NSProgressIndicator()
+        indicator.style = .spinning
+        indicator.controlSize = .small
+        indicator.isIndeterminate = true
+        indicator.isDisplayedWhenStopped = false
+        indicator.startAnimation(nil)
+        return indicator
+    }
+
+    func updateNSView(_ indicator: NSProgressIndicator, context: Context) {
+        indicator.startAnimation(nil)
     }
 }
 
@@ -543,15 +651,17 @@ private struct GlassCircle: ViewModifier {
     }
 }
 
-/// 文字胶囊玻璃（头部「扫描」用）：跟分段控件那条轨道同一个形状、同一套材质
-private struct GlassPill: ViewModifier {
+/// 圆角玻璃卡片（「最近搜索」浮层用）：跟搜索框同一个材质，形状换成矩形圆角
+private struct GlassCard: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.glassEffect(.regular.interactive(), in: .capsule)
+            content.glassEffect(.regular, in: .rect(cornerRadius: 12))
         } else {
             content
-                .background(Capsule().fill(Color.primary.opacity(0.06)))
-                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+                .background(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.primary.opacity(0.06)))
+                .overlay(RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
         }
     }
 }
@@ -561,11 +671,12 @@ private struct GlassPill: ViewModifier {
 /// 2) 中文输入法打字时，SwiftUI 的 binding 要等选字/回车才更新，自己画的占位文字就会一直压在拼音上面。
 ///    包成 AppKit 之后 placeholder 由系统管，一有字（包括还没上屏的拼音）就消失。
 private struct SearchField: NSViewRepresentable {
-    @Binding var text: String
+    let ui: UIState
 
     final class Coordinator: NSObject, NSTextFieldDelegate {
         var parent: SearchField
         var focusObserver: NSObjectProtocol?
+        var setObserver: NSObjectProtocol?
         init(_ parent: SearchField) { self.parent = parent }
 
         func controlTextDidChange(_ obj: Notification) {
@@ -573,7 +684,31 @@ private struct SearchField: NSViewRepresentable {
             // 中文输入法还没上屏时，marked text 在 field editor 里，field.stringValue 还是空的；
             // 读编辑器的 string 才能跟着拼音实时过滤，而不是等回车。
             let editor = field.currentEditor() as? NSTextView
-            parent.text = editor?.string ?? field.stringValue
+            parent.ui.query = editor?.string ?? field.stringValue
+        }
+
+        func controlTextDidBeginEditing(_ obj: Notification) {
+            parent.ui.searchActive = true
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            // 延一小会儿再收起「最近搜索」：单击是 按下→抬起 两段，
+            // 第一下就已经结束编辑了，立刻收掉的话抬起的动作落在空处，那一行就点不中。
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+                guard let self else { return }
+                let field = obj.object as? NSTextField
+                if field?.currentEditor() == nil { self.parent.ui.searchActive = false }
+            }
+        }
+
+        func control(_ control: NSControl, textView: NSTextView,
+                     doCommandBy commandSelector: Selector) -> Bool {
+            // 回车＝这次搜索告一段落，记进最近搜索；吃掉回车，别让系统响一声
+            if commandSelector == #selector(NSResponder.insertNewline(_:)) {
+                parent.ui.commitSearch(textView.string.isEmpty ? parent.ui.query : textView.string)
+                return true
+            }
+            return false
         }
     }
 
@@ -603,6 +738,19 @@ private struct SearchField: NSViewRepresentable {
             window.makeFirstResponder(field)
             field.currentEditor()?.selectAll(nil)
         }
+        // 外部改写内容（清除按钮、点最近搜索里的一条）：连编辑器一起改，否则界面会两套字
+        context.coordinator.setObserver = NotificationCenter.default.addObserver(
+            forName: .updateRadarSetSearch, object: nil, queue: .main
+        ) { [weak field] note in
+            guard let field, let window = field.window else { return }
+            let word = (note.object as? String) ?? ""
+            field.stringValue = word
+            window.makeFirstResponder(field)
+            if let editor = field.currentEditor() as? NSTextView {
+                editor.string = word
+                editor.setSelectedRange(NSRange(location: word.count, length: 0))
+            }
+        }
         return field
     }
 
@@ -610,13 +758,16 @@ private struct SearchField: NSViewRepresentable {
         if let token = coordinator.focusObserver {
             NotificationCenter.default.removeObserver(token)
         }
+        if let token = coordinator.setObserver {
+            NotificationCenter.default.removeObserver(token)
+        }
     }
 
     func updateNSView(_ field: NSTextField, context: Context) {
         context.coordinator.parent = self
         // 只在外部真的改了内容时回写，别在用户打字（尤其拼音还没上屏）时去重置它
-        if field.stringValue != text, field.currentEditor() == nil {
-            field.stringValue = text
+        if field.stringValue != ui.query, field.currentEditor() == nil {
+            field.stringValue = ui.query
         }
     }
 }
@@ -710,15 +861,10 @@ struct RowView: View {
                 }
             }
 
-            // 更新说明：收起时只取第一行，左边缘与图标对齐（跟 App Store 一样）
+            // 更新说明只在点开这一行之后才显示：收起的列表只留图标、名字、版本、状态，
+            // 名单一眼扫得完；想看这次更新了什么，左击这一行展开。
             if expanded {
                 notesBlock
-            } else if let notes = row.result?.notes, !notes.isEmpty, row.isUpdate {
-                Text(notes)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.tail)
             }
         }
         // 右边多留一点：滚动时系统的滚动条会浮在上面，胶囊贴太近会显得挤

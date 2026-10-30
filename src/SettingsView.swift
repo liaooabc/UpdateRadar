@@ -10,6 +10,7 @@ struct SettingsView: View {
     @ObservedObject var service: UpdateService
     @ObservedObject var updater: SelfUpdater
     @ObservedObject private var notifier = Notifier.shared
+    @ObservedObject private var launchAtLogin = LaunchAtLogin.shared
 
     // MARK: - 绑定（直接落到 UpdateService 的 setter 上，改完立刻存盘）
 
@@ -27,6 +28,10 @@ struct SettingsView: View {
     }
     private var notifyOnUpdates: Binding<Bool> {
         Binding(get: { service.settings.notifyEnabled }, set: { service.setNotify($0) })
+    }
+    /// 登录项：状态归系统（SMAppService）管，不落到 state.json，所以每次打开窗口都重读一次
+    private var openAtLogin: Binding<Bool> {
+        Binding(get: { launchAtLogin.isEnabled }, set: { launchAtLogin.setEnabled($0) })
     }
 
     // MARK: - 文案
@@ -138,6 +143,27 @@ struct SettingsView: View {
     var body: some View {
         Form {
             Section {
+                Toggle("登录时打开", isOn: openAtLogin)
+                // 失败原因必须就地显示：开关会自己弹回去，不写清楚用户只会以为「点了没反应」
+                if launchAtLogin.requiresApproval {
+                    Text("已加入登录项，但还要去「系统设置 → 通用 → 登录项」里允许一次，才会真的开机启动。")
+                        .font(.callout)
+                        .foregroundStyle(.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                if let error = launchAtLogin.lastError {
+                    Text(error)
+                        .font(.callout)
+                        .foregroundStyle(.red)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            } header: {
+                Text("启动")
+            } footer: {
+                Text("登录 macOS 后在菜单栏自动运行。这项状态由系统管，也可以在「系统设置 → 通用 → 登录项」里改。")
+            }
+
+            Section {
                 TimelineView(.periodic(from: .now, by: 30)) { context in
                     LabeledContent("上次检测", value: lastCheckText(at: context.date))
                 }
@@ -247,6 +273,8 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .toggleStyle(.switch)
         .defaultScrollAnchor(.top)
+        // 用户可能刚在系统设置里关掉过它，窗口一露脸就按系统的真实状态重画
+        .onAppear { launchAtLogin.refresh() }
         .frame(minWidth: 420, maxWidth: .infinity, maxHeight: .infinity)
     }
 }
@@ -298,6 +326,8 @@ final class SettingsWindowController {
     func show() {
         // 用户可能刚在系统设置里改过通知权限，打开设置页时重新读一次真实状态
         Notifier.shared.refreshAuthorization()
+        // 登录项同理：用户也可能在「系统设置 → 登录项」里直接关掉
+        LaunchAtLogin.shared.refresh()
         let w = window ?? build()
         window = w
         NSApp.activate(ignoringOtherApps: true)

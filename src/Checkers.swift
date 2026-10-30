@@ -83,12 +83,37 @@ final class AppcastParser: NSObject, XMLParserDelegate {
             current = Item()
         }
         if el == "enclosure", inItem {
-            current?.enclosure = attributeDict["url"]
-            if current?.buildVersion == nil {
-                current?.buildVersion = attributeDict["sparkle:version"] ?? attributeDict["version"]
+            // Sparkle 1.5+ 常把版本写在 enclosure 属性上，而不是子元素里。
+            // 属性名大小写、带不带 sparkle: 前缀都不统一，按「后缀匹配」取。
+            if let url = Self.attr(attributeDict, names: ["url"]) {
+                current?.enclosure = url
+            }
+            if current?.shortVersion == nil,
+               let s = Self.attr(attributeDict, names: ["sparkle:shortversionstring", "shortversionstring"]) {
+                current?.shortVersion = s
+            }
+            if current?.buildVersion == nil,
+               let b = Self.attr(attributeDict, names: ["sparkle:version", "version"]) {
+                current?.buildVersion = b
+            }
+            if current?.minSystem == nil,
+               let m = Self.attr(attributeDict, names: ["sparkle:minimumsystemversion", "minimumsystemversion"]) {
+                current?.minSystem = m
             }
         }
         if inItem { buffer = "" }
+    }
+
+    /// enclosure 属性：匹配完整名或「冒号后的本地名」，大小写不敏感。
+    private static func attr(_ dict: [String: String], names: [String]) -> String? {
+        let want = Set(names.map { $0.lowercased() })
+        for (key, value) in dict {
+            guard !value.isEmpty else { continue }
+            let low = key.lowercased()
+            let local = low.split(separator: ":").last.map(String.init) ?? low
+            if want.contains(low) || want.contains(local) { return value }
+        }
+        return nil
     }
 
     func parser(_ parser: XMLParser, foundCharacters string: String) {
@@ -280,14 +305,40 @@ enum Net {
         return probe.target
     }
 
-    private static func fetchText(_ urlString: String) async -> String? {
-        guard let url = URL(string: urlString) else { return nil }
+    /// 更新源失败的原因。以前所有失败都压成一个 nil，上层只能笼统说「更新源没有响应」，
+    /// 用户分不清是超时、404，还是源跳到了一张网页 —— Luminar Neo 就是第三种：
+    /// 301 到一张追踪页，回了 200 但内容是 HTML，跟「网络不通」完全是两回事。
+    enum SourceError: Error {
+        case timeout
+        case transport
+        case status(Int)
+        case empty
+        case notAppcast
+        case noItems
+        case incompatibleSystem
+
+        var note: String {
+            switch self {
+            case .timeout: return "更新源超时（8 秒没有响应）"
+            case .transport: return "更新源连接失败（DNS 或 TLS 出错）"
+            case .status(let code): return "更新源返回 HTTP \(code)"
+            case .empty: return "更新源返回了空内容"
+            case .notAppcast: return "更新源跳到的是网页，不是 appcast（源地址可能已失效）"
+            case .noItems: return "更新源里没有可识别的版本条目"
+            case .incompatibleSystem: return "更新源里的版本要求比本机系统更高，暂时装不了"
+            }
+        }
+    }
+
+    private static func fetch(_ urlString: String) async -> Result<String, SourceError> {
+        guard let url = URL(string: urlString) else { return .failure(.transport) }
         do {
             let (data, resp) = try await session.data(from: url)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode) else { return nil }
-            return String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self)
-        } catch {
-            return nil
+            guard let http = resp as? HTTPURLResponse else { return .failure(.transport) }
+            guard (200..<300).contains(http.statusCode) else { return .failure(.status(http.statusCode)) }
+            return .success(String(data: data, encoding: .utf8) ?? String(decoding: data, as: UTF8.self))
+        } catch let e as NSError {
+            return .failure(e.domain == NSURLErrorDomain && e.code == NSURLErrorTimedOut ? .timeout : .transport)
         }
     }
 
@@ -297,9 +348,17 @@ enum Net {
     /// 现在只保留 raw.githubusercontent.com → jsDelivr 的镜像兜底（那是「换条路能通」，
     /// 不是「同一条路再撞一次」）。
     static func text(_ urlString: String) async -> String? {
-        if let s = await fetchText(urlString) { return s }
-        if let alt = jsdelivrMirror(urlString), let s = await fetchText(alt) { return s }
+        if case .success(let s) = await textResult(urlString) { return s }
         return nil
+    }
+
+    /// 和 text 一样，但把失败原因带上去（只有 appcast 这条路要看原因）
+    static func textResult(_ urlString: String) async -> Result<String, SourceError> {
+        let first = await fetch(urlString)
+        if case .failure = first, let alt = jsdelivrMirror(urlString) {
+            return await fetch(alt)
+        }
+        return first
     }
 
     /// HTTP 状态码。GitHub 未认证时限流会返回 403 + X-RateLimit-Remaining: 0，
@@ -465,7 +524,11 @@ enum Cask {
     private static func cleanVersion(_ raw: String) -> String? {
         var v = raw.split(separator: ",").first.map(String.init) ?? raw
         v = v.trimmingCharacters(in: .whitespaces)
-        if let dash = v.firstIndex(of: "-"), v[..<dash].contains(where: { $0.isNumber }) {
+        // 只在后缀是「构建号 / commit」这种形态时才截断。4.0.0-beta.1 这类是**预发布版本号**，
+        // 截断会变成正式版 4.0.0：上层 isPrereleaseVersion 再也看不到 beta，
+        // 于是把 beta 当成正式更新推给用户（仓库里 7813 个 cask 有 59 个是这种写法）。
+        if !isPrereleaseVersion(v), let dash = v.firstIndex(of: "-"),
+           v[..<dash].contains(where: { $0.isNumber }) {
             v = String(v[..<dash])
         }
         guard let first = v.first, first.isNumber else { return nil }
@@ -507,12 +570,16 @@ enum Cask {
     }
 
     static func verdict(_ app: InstalledApp, entry: Entry, allowBeta: Bool) -> Checker.Outcome {
+        // 「只跟正式版比」是给装正式版的人用的。本机装的本身就是测试版（用户已经在尝鲜通道上），
+        // 那跟测试版比才是有意义的，不然等于把他钉死在当前这个 RC 上。
+        let compareBeta = allowBeta || isPrereleaseVersion(app.version)
         // 版本库里记的是测试版时不提示（有些 cask 会跟到 beta 上）
-        if !allowBeta, isPrereleaseVersion(entry.version) {
+        if !compareBeta, isPrereleaseVersion(entry.version) {
             return Checker.Outcome(status: .upToDate, latest: app.version,
                                    url: entry.homepage ?? "https://formulae.brew.sh/cask/\(entry.token)",
                                    homepage: entry.homepage,
-                                   note: "只跟正式版比：版本库里现在记的是测试版（\(entry.version)）")
+                                   note: "只跟正式版比：版本库里现在记的是测试版（\(entry.version)）",
+                                   suppressedBeta: true)
         }
         // 版本库里记的是构建号（Office 的 cask version 就是 16.114.26102031）：
         // 本机装的就是这个包，别报更新。
@@ -568,7 +635,8 @@ enum Checker {
             return CheckResult(bundleId: bid, status: best.status, latest: best.latest,
                                downloadURL: best.url, homepage: best.homepage, note: best.note,
                                source: "appstore", checkedAt: now,
-                               releaseDate: best.releaseDate, notes: best.notes)
+                               releaseDate: best.releaseDate, notes: best.notes,
+                               suppressedBeta: best.suppressedBeta ? true : nil)
         }
 
         // 2. MAS 版 App 但 iTunes lookup 也查不到（已下架、bundleId 对不上、网络故障）。
@@ -628,7 +696,7 @@ enum Checker {
                                    downloadURL: r.url, homepage: r.homepage ?? r.url, note: r.note,
                                    source: "vendor",
                                    checkedAt: now, releaseDate: r.releaseDate, notes: r.notes,
-                                   marker: r.marker)
+                                   marker: r.marker, suppressedBeta: r.suppressedBeta ? true : nil)
             }
             // 规则命中但这次没抓到：说明是网络/页面变动问题，不是“没有检测源”
             return failed("官网页面没抓到版本号")
@@ -636,19 +704,22 @@ enum Checker {
 
         // 2. Sparkle appcast：34 个 App 走这条路
         if let feed = app.sparkleFeed {
-            if let r = await sparkle(feed: feed, current: app.version, build: app.build,
-                                     allowBeta: allowBeta) {
+            switch await sparkle(feed: feed, current: app.version, build: app.build,
+                                 allowBeta: allowBeta) {
+            case .success(let r):
                 return CheckResult(bundleId: bid, status: r.status, latest: r.latest,
                                    downloadURL: r.url,
                                    homepage: r.homepage ?? siteFromFeed(feed),
                                    note: nil, source: "sparkle",
-                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes)
+                                   checkedAt: now, releaseDate: r.releaseDate, notes: r.notes,
+                                   suppressedBeta: r.suppressedBeta ? true : nil)
+            case .failure(let why):
+                // appcast 这次没抓到：先用社区版本库兜一层，别急着报「检测失败」
+                if let entry = await Cask.lookup(app) {
+                    return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
+                }
+                return failed(why.note)
             }
-            // appcast 这次没抓到：先用社区版本库兜一层，别急着报「检测失败」
-            if let entry = await Cask.lookup(app) {
-                return result(app, Cask.verdict(app, entry: entry, allowBeta: allowBeta), source: "cask", now: now)
-            }
-            return failed("更新源没有响应")
         }
 
         // 3. Homebrew Cask：没有 appcast、不在商店、也没有厂商规则的，最后一层
@@ -664,7 +735,8 @@ enum Checker {
     static func result(_ app: InstalledApp, _ o: Outcome, source: String, now: Date) -> CheckResult {
         CheckResult(bundleId: app.id, status: o.status, latest: o.latest,
                     downloadURL: o.url, homepage: o.homepage ?? o.url, note: o.note, source: source,
-                    checkedAt: now, releaseDate: o.releaseDate, notes: o.notes)
+                    checkedAt: now, releaseDate: o.releaseDate, notes: o.notes,
+                    suppressedBeta: o.suppressedBeta ? true : nil)
     }
 
 
@@ -678,16 +750,33 @@ enum Checker {
         var notes: String?
         /// 官网安装包指纹（只给安装包、不给版本号的 App 用）
         var marker: String? = nil
+        /// 这条结果是被「不接收测试版」这个开关压下去的（源里最新的其实是 beta）。
+        /// 切开关时要靠这个标记重查，别再拿中文提示文案做判断依据。
+        var suppressedBeta: Bool = false
     }
 
-    static func sparkle(feed: String, current: String, build: String?, allowBeta: Bool) async -> Outcome? {
-        guard let body = await Net.text(feed), !body.isEmpty else { return nil }
+    static func sparkle(feed: String, current: String, build: String?, allowBeta: Bool) async -> Result<Outcome, Net.SourceError> {
+        let body: String
+        switch await Net.textResult(feed) {
+        case .success(let s): body = s
+        case .failure(let e): return .failure(e)
+        }
+        guard !body.isEmpty else { return .failure(.empty) }
         let items = AppcastParser().parse(Data(body.utf8))
-        guard !items.isEmpty else { return nil }
+        guard !items.isEmpty else {
+            // 有的源早就废了，301 跳到一张宣传/追踪页：HTTP 200、内容是 HTML，
+            // 说「更新源没有响应」是错怪了网络，得说清是源地址失效。
+            let head = body.prefix(600).lowercased()
+            if head.contains("<html") || head.contains("<!doctype html") {
+                return .failure(.notAppcast)
+            }
+            return .failure(.noItems)
+        }
 
         // appcast 里条目按新到旧排列，取第一条「正式版 + 本机系统能装」的。
-        // 带 <sparkle:channel> 的（beta 通道）和版本号里带 Beta/RC 的一律跳过：
-        // 用户只要稳定版，别拿 beta 去提示「有新版本」。
+        // 带 <sparkle:channel> 的（beta 通道）和版本号里带 Beta/RC 的一律跳过，
+        // 除非用户勾了「接收测试版」，或者本机装的就是测试版（他本来就在尝鲜通道上）。
+        let compareBeta = allowBeta || isPrereleaseVersion(current)
         var sawAnyVersioned = false
         var sawOnlyPrerelease = true
         for it in items {
@@ -695,18 +784,17 @@ enum Checker {
             sawAnyVersioned = true
             let isBeta = (it.channel?.isEmpty == false) || isPrereleaseVersion(v)
             if !isBeta { sawOnlyPrerelease = false }
-            // 没勾「接收测试版」时才跳过 beta 条目；勾了就按原来的行为，beta 也算新版
-            if !allowBeta, isBeta { continue }
+            if !compareBeta, isBeta { continue }
             guard systemSatisfies(it.minSystem) else { continue }
             let latest = v
             // 有的 Sparkle 源把构建号写进 title，本机装的已经是这个包 → 已是最新
             if latestIsInstalledBuild(latest, current: current, build: build) {
-                return Outcome(status: .upToDate, latest: latest,
-                               url: it.enclosure ?? it.link ?? feed,
-                               homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
-                               note: nil,
-                               releaseDate: parseRFC822(it.pubDate),
-                               notes: plainNotes(it.notes))
+                return .success(Outcome(status: .upToDate, latest: latest,
+                                        url: it.enclosure ?? it.link ?? feed,
+                                        homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
+                                        note: nil,
+                                        releaseDate: parseRFC822(it.pubDate),
+                                        notes: plainNotes(it.notes)))
             }
             let newer = Ver.isNewer(latest, than: current)
             var notes = plainNotes(it.notes)
@@ -715,21 +803,23 @@ enum Checker {
             }
             // notes 不管是不是新版本都存下来：点开「其他」页里已是最新的 App，
             // 也该能看到它这一版更新了什么
-            return Outcome(status: newer ? .updateAvailable : .upToDate,
-                           latest: latest,
-                           url: it.enclosure ?? it.link ?? feed,
-                           homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
-                           note: nil,
-                           releaseDate: parseRFC822(it.pubDate),
-                           notes: notes)
+            return .success(Outcome(status: newer ? .updateAvailable : .upToDate,
+                                    latest: latest,
+                                    url: it.enclosure ?? it.link ?? feed,
+                                    homepage: siteFromFeed(it.link) ?? siteFromFeed(feed),
+                                    note: nil,
+                                    releaseDate: parseRFC822(it.pubDate),
+                                    notes: notes))
         }
         // 更新源里只有测试版（比如作者开了 beta 通道、正式版还没跟上）：
         // 本机装的就是最新正式版，安静地算「已是最新」，别报更新也别报失败。
-        if !allowBeta, sawAnyVersioned, sawOnlyPrerelease {
-            return Outcome(status: .upToDate, latest: current, url: feed, homepage: siteFromFeed(feed),
-                           note: "只跟正式版比：更新源里最新的是测试版（\(items.compactMap { $0.marketingVersion }.first ?? "beta")）")
+        if !compareBeta, sawAnyVersioned, sawOnlyPrerelease {
+            return .success(Outcome(status: .upToDate, latest: current, url: feed, homepage: siteFromFeed(feed),
+                                    note: "只跟正式版比：更新源里最新的是测试版（\(items.compactMap { $0.marketingVersion }.first ?? "beta")）",
+                                    suppressedBeta: true))
         }
-        return nil
+        // 走到这里说明条目里有版本号，但没有一条能装在本机系统上
+        return .failure(sawAnyVersioned ? .incompatibleSystem : .noItems)
     }
 
     static func appStore(bundleId: String, current: String, build: String?, installedAt: Date?,
@@ -765,9 +855,10 @@ enum Checker {
                            releaseDate: release)
         }
 
-        if !allowBeta, isPrereleaseVersion(latest) {
+        if !(allowBeta || isPrereleaseVersion(current)), isPrereleaseVersion(latest) {
             return Outcome(status: .upToDate, latest: current, url: page, homepage: seller,
-                           note: "只跟正式版比：商店里最新的是测试版（\(latest)）", releaseDate: release)
+                           note: "只跟正式版比：商店里最新的是测试版（\(latest)）", releaseDate: release,
+                           suppressedBeta: true)
         }
         let isNewer = Ver.isNewer(latest, than: current)
         // 商店给的版本号比包内标注的还低：Apple 这个接口对「iOS 和 Mac 是同一个商品」的 App
@@ -798,11 +889,12 @@ enum Rules {
     /// 把一个「官方最新版本号」变成检测结果；本机反而更高时给个说明
     static func verdict(_ app: InstalledApp, latest: String, url: String, releaseDate: Date? = nil,
                         allowBeta: Bool = false) -> Checker.Outcome {
-        // 抓到的要是测试版（2.0.0-beta.3、1.2rc1 这种），就不算更新：只跟正式版比
-        if !allowBeta, isPrereleaseVersion(latest) {
+        // 抓到的要是测试版（2.0.0-beta.3、1.2rc1 这种），就不算更新：只跟正式版比。
+        // 例外：本机装的本身就是测试版，那就照常比（用户已经在尝鲜通道上）。
+        if !(allowBeta || isPrereleaseVersion(app.version)), isPrereleaseVersion(latest) {
             return Checker.Outcome(status: .upToDate, latest: app.version, url: url, homepage: url,
                                    note: "只跟正式版比：更新源里最新的是测试版（\(latest)）",
-                                   releaseDate: releaseDate)
+                                   releaseDate: releaseDate, suppressedBeta: true)
         }
         // 官网页面抓到的是构建号：本机装的已是这个包
         if latestIsInstalledBuild(latest, current: app.version, build: app.build) {

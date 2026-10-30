@@ -55,6 +55,8 @@ final class UpdateService: ObservableObject {
         Task { [weak self] in
             let found = await Task.detached(priority: .utility) { Scanner.scan() }.value
             guard let self else { return }
+            // 扫之前记下旧名单：用来判断「新装 / 本机版本变了」，别把磁盘抖动当成全量重查
+            let previousById = Dictionary(uniqueKeysWithValues: self.apps.map { ($0.id, $0) })
             self.scanning = false
             self.apps = found
             // 只清「已卸载 App 的检测结果」，别动 ignored / dismissed：
@@ -68,7 +70,35 @@ final class UpdateService: ObservableObject {
             }
             self.appCount = self.apps.count
             self.rebuild()
-            if thenCheck { self.checkAll(force: force) }
+            guard thenCheck else { return }
+            if force {
+                // 用户点「扫描」：全量重查
+                self.checkAll(force: true)
+            } else if previousById.isEmpty {
+                // 启动首次扫描：按 TTL 补过期的，保留磁盘里还新鲜的结果
+                self.checkAll(force: false)
+            } else {
+                // 目录监听触发：只查新装的、本机版本/构建号变了的、还没有结果的。
+                // 用 force+only，避免「结果还在 TTL 内」把刚升级过的 App 跳过。
+                var need = Set<String>()
+                for app in found {
+                    if previousById[app.id] == nil {
+                        need.insert(app.id)
+                        continue
+                    }
+                    if self.results[app.id] == nil {
+                        need.insert(app.id)
+                        continue
+                    }
+                    if let old = previousById[app.id],
+                       old.version != app.version || old.build != app.build {
+                        need.insert(app.id)
+                    }
+                }
+                if !need.isEmpty {
+                    self.checkAll(force: true, only: need)
+                }
+            }
         }
     }
 
@@ -78,6 +108,53 @@ final class UpdateService: ObservableObject {
     /// 一批里最慢的那个（国内常有 10 秒级的响应）会拖住整批；改成滑动窗口，
     /// 谁先回来就立刻补一个进去，总耗时接近「总请求数 / 并发数」。
     private static let maxConcurrentChecks = 12
+
+    /// 失败重试的账本：每条失败结果各自记次数，成功 / 卸载 / 被忽略就销账。
+    /// 以前是一个全局布尔，一旦有永久失败的源、或者某条失败记录属于已被忽略的 App
+    /// （那种记录永远不会被重查，也就永远不会清），布尔就再也复位不了，
+    /// 补查一辈子只发生一次。按 id 记账就没这个问题。
+    private var failedRetryAttempts: [String: Int] = [:]
+    /// 已经排着的那次补查；同一时间只挂一个，不叠加
+    private var pendingFailedRetry: DispatchWorkItem?
+    /// 同一条失败最多补查 3 次：死源不该变成每 15 分钟一次的空转轮询
+    private static let maxFailedRetries = 3
+    private static let failedRetryDelay: TimeInterval = 15 * 60
+
+    /// 还需要重试的失败条目：忽略掉的、已经卸载的 App 不会被重查，不能算进来
+    private var failedIdsNeedingRetry: Set<String> {
+        let live = Set(apps.map(\.id)).subtracting(settings.ignored)
+        return Set(results.filter { $0.value.status == .failed && live.contains($0.key) }.keys)
+    }
+
+    /// 失败的那几条 15 分钟后再给一次机会。只靠 failedTTL 没用 ——
+    /// 没有任何东西会主动触发下一轮检查，等 6 小时的定时器醒来就晚了一整个周期。
+    private func retryFailedIfNeeded() {
+        let failed = failedIdsNeedingRetry
+        // 已经不再失败的连账一起销掉，账本不会越攒越大，新失败永远有完整的 3 次机会
+        failedRetryAttempts = failedRetryAttempts.filter { failed.contains($0.key) }
+        guard !failed.isEmpty else {
+            pendingFailedRetry?.cancel()
+            pendingFailedRetry = nil
+            return
+        }
+        // 已经排着一次就别再排：否则每轮结束都把时间往后推 15 分钟
+        guard pendingFailedRetry == nil else { return }
+        guard failed.contains(where: { (failedRetryAttempts[$0] ?? 0) < Self.maxFailedRetries }) else {
+            return
+        }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            self.pendingFailedRetry = nil
+            // 撞上正在检查时不能就这样丢掉这次补查（以前 checkAll 里的 guard !checking
+            // 会静默吞掉它，那一批失败得等到 6 小时后的定时器）。
+            // 正在跑的那一轮结束时会再调 retryFailedIfNeeded，重新排上。
+            guard !self.checking else { return }
+            for id in failed { self.failedRetryAttempts[id, default: 0] += 1 }
+            self.checkAll(only: failed)
+        }
+        pendingFailedRetry = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.failedRetryDelay, execute: work)
+    }
 
     /// force = false（定时、启动）：结果还新鲜的 App 直接跳过，只补查过期的
     /// force = true（用户点「检查更新」或刷新按钮）：全部重查
@@ -93,7 +170,11 @@ final class UpdateService: ObservableObject {
 
         // 这里用的是 settings.intervalHours：每 6 小时检查一次，就不会每 6 小时里反复查
         let ttl = max(0.25, settings.intervalHours) * 3600
+        // 失败的结果不该冻结一整个周期：Cinemagraph Pro 那次只是瞬时超时，
+        // 却按 6 小时 TTL 一直挂着「更新源没有响应」。失败的 15 分钟后就重试。
+        let failedTTL: TimeInterval = 15 * 60
         let cutoff = Date().addingTimeInterval(-ttl)
+        let now = Date()
 
         let allowBeta = settings.receiveBetaEnabled
         let targets = apps
@@ -102,6 +183,9 @@ final class UpdateService: ObservableObject {
                 if let only { return only.contains(app.id) }
                 guard !force else { return true }
                 guard let r = results[app.id] else { return true }
+                if r.status == .failed {
+                    return now.timeIntervalSince(r.checkedAt) > min(ttl, failedTTL)
+                }
                 return r.checkedAt < cutoff
             }
             .sorted { priority($0) > priority($1) }
@@ -147,6 +231,7 @@ final class UpdateService: ObservableObject {
             self.progress = 1
             self.save()
             self.notifyIfNeeded()
+            self.retryFailedIfNeeded()
             if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {
                 let ms = Int(Date().timeIntervalSince(started) * 1000)
                 FileHandle.standardError.write("[UR] 本轮查了 \(targets.count) 个 App，用时 \(ms) ms\n".data(using: .utf8)!)
@@ -180,7 +265,8 @@ final class UpdateService: ObservableObject {
         pendingRescan?.cancel()
         let work = DispatchWorkItem { [weak self] in
             self?.pendingRescan = nil
-            self?.rescan()
+            // 装、卸、改名后要接着补查，不能只刷新名单等下一轮定时
+            self?.rescan(thenCheck: true, force: false)
         }
         pendingRescan = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0, execute: work)
@@ -301,8 +387,9 @@ final class UpdateService: ObservableObject {
                 // 关掉：现在正在提示测试版的那几条要立刻改判
                 if let l = r.latest, isPrereleaseVersion(l) { return row.id }
             }
-            // 之前被过滤成「只有测试版」的，两种方向都要重查
-            if r.note?.hasPrefix("只跟正式版比") == true { return row.id }
+            // 被这个开关压下去的（商店 / 厂商规则 / cask / 只有 beta 的 appcast），
+            // 两个方向都要重查
+            if r.suppressedBeta == true { return row.id }
             return nil
         })
         if ProcessInfo.processInfo.environment["UR_DEBUG"] != nil {

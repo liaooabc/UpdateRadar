@@ -7,7 +7,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var popover: NSPopover?
     private let service = UpdateService()
-    private let aboutController = AboutWindowController()
     private let updater = SelfUpdater()
     private lazy var settingsController = SettingsWindowController(service: service, updater: updater)
     private let ui = UIState()
@@ -17,6 +16,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var selfCheckScheduler: NSBackgroundActivityScheduler?
     /// 面板开着时的键盘监听（↑↓ / Return）；只有面板是 key window 才接管
     private var keyMonitor: Any?
+    /// 面板开着时的全局鼠标监听：点别的 App 的任何地方都收掉面板
+    private var outsideClickMonitor: Any?
 
     // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
     // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
@@ -50,6 +51,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { [weak self] _ in
             Task { @MainActor in
                 self?.removePanelKeyMonitor()
+                self?.removeOutsideClickMonitor()
                 self?.updateBadge()
             }
         }
@@ -120,7 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showSettings() }
         }
         if env["UPDATERADAR_SHOW_ABOUT"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.aboutController.show() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showAbout() }
         }
         if env["UPDATERADAR_SHOW_MENU"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
@@ -255,6 +257,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.activate(ignoringOtherApps: true)
         popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
         installPanelKeyMonitor()
+        installOutsideClickMonitor()
     }
 
     private func hidePanel() {
@@ -280,6 +283,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let keyMonitor {
             NSEvent.removeMonitor(keyMonitor)
             self.keyMonitor = nil
+        }
+    }
+
+    /// 面板是开着的时候，点「别的 App」的任何地方（别人的窗口、桌面、Dock、菜单栏图标）都收掉。
+    /// 全局监视器只收到发给别的进程的事件，所以点面板本身、点设置/关于窗口都不会把自己关掉 ——
+    /// 正好是「点任何地方都关，除了本软件窗口」。
+    private func installOutsideClickMonitor() {
+        guard outsideClickMonitor == nil else { return }
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
+            matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
+        ) { [weak self] _ in
+            Task { @MainActor in self?.hidePanel() }
+        }
+    }
+
+    private func removeOutsideClickMonitor() {
+        if let outsideClickMonitor {
+            NSEvent.removeMonitor(outsideClickMonitor)
+            self.outsideClickMonitor = nil
         }
     }
 
@@ -553,7 +575,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = nil
     }
 
-    @objc private func showAbout() { aboutController.show() }
+    /// 关于面板交给系统画（orderFrontStandardAboutPanel）：
+    /// 图标尺寸、名称字号、版本行、版权、credits 的排版和间距都是 macOS 自己的规范，
+    /// 深浅色、Liquid Glass、窗口尺寸随系统一起变，不用自己跟着每个大版本重画。
+    @objc private func showAbout() {
+        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
+        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
+
+        let body: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+            .foregroundColor: NSColor.secondaryLabelColor
+        ]
+        let credits = NSMutableAttributedString(
+            string: "扫描本机 App，有新版就提醒你。数据只存在本机。\n",
+            attributes: body
+        )
+        if let url = URL(string: "https://github.com/liaooabc/UpdateRadar/issues") {
+            credits.append(NSAttributedString(string: "反馈问题", attributes: [
+                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
+                .link: url
+            ]))
+        }
+
+        // 版权行不在 options 里：系统关于面板是从 Info.plist 的 NSHumanReadableCopyright 读的，
+        // 这样本地化/设置界面都不用再抄一份版权文案。
+        // 图标不用传：不写 .applicationIcon 时系统自己用 App 的图标，
+        // 传 NSApp.applicationIconImage 只是把那个 implicitly unwrapped 的可选值塞进 Any，
+        // 编译器会为它报一条「coercion of implicitly unwrappable value」的警告。
+        NSApp.orderFrontStandardAboutPanel(options: [
+            .applicationName: "更新雷达",
+            .applicationVersion: short,
+            .version: build,
+            .credits: credits
+        ])
+        NSApp.activate(ignoringOtherApps: true)
+    }
 
     @objc private func checkNow() {
         service.rescan(thenCheck: true, force: true)
@@ -562,6 +618,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quitApp() { NSApp.terminate(nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+
+    /// 面板开着时切到别的 App（点别人的窗口、⌘Tab、点菜单栏里的系统图标）要自动收起。
+    /// NSPopover 的 .transient 在这里靠不住：它靠「popover 窗口失去 key」来收，
+    /// 而状态栏弹层（尤其 .accessory 应用）有时根本拿不到 key，于是点了别的窗口它还杵在那儿。
+    func applicationDidResignActive(_ notification: Notification) {
+        hidePanel()
+    }
 
     /// 系统会调用它来确认「关掉窗口后能不能安全恢复状态」。我们只有菜单栏面板和两个窗口，
     /// 全部由 AppKit 恢复，直接返回 true；否则日志里一直有一条告警。

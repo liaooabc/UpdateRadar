@@ -50,6 +50,10 @@ struct CheckResult: Identifiable, Codable, Equatable {
     /// 官网安装包指纹（文件名的构建时间戳）。官网只放安装包、不写版本号的 App
     /// （扣子桌面端）用它判断「官网的包换了没」，因为压根没有版本号可比。
     var marker: String? = nil
+    /// 这条结果是被「不接收测试版」开关压下去的（更新源里最新的其实是 beta）。
+    /// 切开关时要重查这些 App —— 用结构化标记，别去 match 中文提示文案。
+    /// 可选是为了兼容旧版 state.json（没有这个键就是 nil）。
+    var suppressedBeta: Bool? = nil
 
     var id: String { bundleId }
 }
@@ -104,13 +108,8 @@ struct AppRow: Identifiable {
         case .updateAvailable:
             // 官网只放安装包、没有版本号的那种：只能告诉你「官网换包了」
             guard let latest else { return "\(app.version)　·　官网有新安装包" }
-            let base = "\(app.version)  →  \(latest)"
-            if let d = result?.releaseDate {
-                let f = DateFormatter()
-                f.dateFormat = "M月d日"
-                return base + "　·　" + f.string(from: d)
-            }
-            return base
+            // 副标题只留「本机版本 → 新版本」，不再追加发布日期
+            return "\(app.version)  →  \(latest)"
         case .upToDate:
             if let n = result?.note, n.hasPrefix("手动确认") {
                 return "\(app.version)　已确认最新（商店 \(latest ?? "?"))"
