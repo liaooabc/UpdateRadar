@@ -377,8 +377,45 @@ enum Net {
 
     /// GitHub 专用：区分「限流」和「仓库没了」。
     /// 未认证配额只有 60 次/小时/IP（同一个 Wi-Fi 下几台 Mac 共用），撞墙时要说清原因。
-    /// 每次带上次的 ETag：release 没变 → 304 → 不计配额。
+    /// 所以优先走网页跳转（/releases/latest 302 → /releases/tag/vX.Y.Z），普通网页请求不占配额；
+    /// 跳转不通才回退 API（带 ETag，没变就 304、不计配额）。
     static func githubLatestRelease(_ repo: String) async -> Result<[String: Any]?, HTTPError> {
+        if let tag = await githubLatestTagViaRedirect(repo) {
+            return .success(["tag_name": tag])
+        }
+        return await githubLatestReleaseViaAPI(repo)
+    }
+
+    /// 抠 302 的落地地址：/releases/latest → /releases/tag/vX.Y.Z，读 tag。
+    /// 掐断重定向后 data(for:) 会抛错，所以目标地址由代理侧记，不走返回值。
+    private static func githubLatestTagViaRedirect(_ repo: String) async -> String? {
+        guard let url = URL(string: "https://github.com/\(repo)/releases/latest") else { return nil }
+        let blocker = RedirectBlocker()
+        // 复用 Net.session 的配置（自定义 UA、缓存策略），裸 CFNetwork UA 有被拒的可能
+        let s = URLSession(configuration: session.configuration, delegate: blocker, delegateQueue: nil)
+        defer { s.finishTasksAndInvalidate() }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        _ = try? await s.data(for: request)   // 重定向被掐断会抛错，正常
+        guard let final = blocker.target?.absoluteString else { return nil }
+        guard let tag = final.components(separatedBy: "/releases/tag/").last,
+              !tag.isEmpty, tag != final else { return nil }
+        return tag
+    }
+
+    /// 挡住重定向，只记落地地址（与 redirectTarget 的 RedirectProbe 同套路）
+    private final class RedirectBlocker: NSObject, URLSessionTaskDelegate {
+        var target: URL?
+        func urlSession(_ session: URLSession, task: URLSessionTask,
+                        willPerformHTTPRedirection response: HTTPURLResponse,
+                        newRequest request: URLRequest,
+                        completionHandler: @escaping (URLRequest?) -> Void) {
+            target = request.url
+            completionHandler(nil)
+        }
+    }
+
+    private static func githubLatestReleaseViaAPI(_ repo: String) async -> Result<[String: Any]?, HTTPError> {
         let url = "https://api.github.com/repos/\(repo)/releases/latest"
         guard let u = URL(string: url) else { return .success(nil) }
         var request = URLRequest(url: u)

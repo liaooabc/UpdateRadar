@@ -144,8 +144,11 @@ struct ContentView: View {
     private var rowGroups: [RowGroup] {
         let ignoredIds = Set(service.settings.ignored)
         var base = service.rows
-        if service.settings.hideUnknown {
+        if service.settings.hideUnknownEnabled {
             base = base.filter { $0.hasSource || ignoredIds.contains($0.id) }
+        }
+        if service.settings.hideFailedEnabled {
+            base = base.filter { $0.status != .failed || ignoredIds.contains($0.id) }
         }
         if !ui.query.isEmpty {
             base = base.filter { $0.app.name.localizedCaseInsensitiveContains(ui.query) }
@@ -196,7 +199,7 @@ struct ContentView: View {
             // 不用系统蓝，才对得上照片 App 那个 日/周/月/年。
             HStack(spacing: 2) {
                 segButton("可更新 \(service.updateCount)", index: 0)
-                segButton("其他 \(service.rows.filter { !$0.isUpdate }.count)", index: 1)
+                segButton("其他 \(rowGroups.reduce(0) { $0 + $1.rows.count })", index: 1)
             }
             .padding(3)
             .coordinateSpace(name: "tabTrack")
@@ -572,7 +575,8 @@ private struct TabFrameKey: PreferenceKey {
 private struct ScrollEdgeBlur: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
-            content.scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
+            // .soft 太透，滚到条底下的内容还看得清；.hard 是系统工具栏那档，糊得更实
+            content.scrollEdgeEffectStyle(.hard, for: [.top, .bottom])
         } else {
             content
         }

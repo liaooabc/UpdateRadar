@@ -24,7 +24,10 @@ struct SettingsView: View {
         Binding(get: { service.settings.countVisible }, set: { service.setShowCount($0) })
     }
     private var hideUnknown: Binding<Bool> {
-        Binding(get: { service.settings.hideUnknown }, set: { service.setHideUnknown($0) })
+        Binding(get: { service.settings.hideUnknownEnabled }, set: { service.setHideUnknown($0) })
+    }
+    private var hideFailed: Binding<Bool> {
+        Binding(get: { service.settings.hideFailedEnabled }, set: { service.setHideFailed($0) })
     }
     private var notifyOnUpdates: Binding<Bool> {
         Binding(get: { service.settings.notifyEnabled }, set: { service.setNotify($0) })
@@ -189,10 +192,11 @@ struct SettingsView: View {
             Section {
                 Toggle("在菜单栏显示更新数量", isOn: showCount)
                 Toggle("隐藏没有检测源的 App", isOn: hideUnknown)
+                Toggle("隐藏检测失败的 App", isOn: hideFailed)
             } header: {
                 Text("显示")
             } footer: {
-                Text("打开后，查不到更新源的 App 不会出现在列表里；关掉则在「其他」页里照常显示。")
+                Text("打开后，查不到更新源、或检测失败的 App 不会出现在列表里；关掉则在「其他」页里照常显示。")
             }
 
             Section {

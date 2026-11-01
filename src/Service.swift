@@ -343,6 +343,11 @@ final class UpdateService: ObservableObject {
         save()
     }
 
+    func setHideFailed(_ hide: Bool) {
+        settings.hideFailed = hide
+        save()
+    }
+
     /// 用户说「这个已经是最新」：记下当时的商店版本号，商店再涨版本会自动恢复提醒
     func dismiss(_ row: AppRow) {
         var map = settings.dismissed ?? [:]

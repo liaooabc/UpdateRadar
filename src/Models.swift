@@ -62,8 +62,12 @@ struct AppSettings: Codable, Equatable {
     var intervalHours: Double = 6
     var ignored: [String] = []
     var lastCheck: Date?
-    /// 只显示有自动检测源的 App（默认关：全部列出，没源的排在后面）
-    var hideUnknown: Bool = false
+    /// 只显示有自动检测源的 App（默认开：没源的藏起来，设置里能再打开）。
+    /// 可选是为了兼容旧版 state.json 没有这个键。
+    var hideUnknown: Bool?
+    /// 隐藏检测失败的 App（默认开）。失败多是源暂时抽风，15 分钟后会补查，
+    /// 平时不用占列表的位置。
+    var hideFailed: Bool?
     /// 可选是为了兼容旧版 state.json 里没有这两个键的情况
     var notifyOnUpdates: Bool?
     var showCount: Bool?
@@ -77,6 +81,8 @@ struct AppSettings: Codable, Equatable {
     var notifyEnabled: Bool { notifyOnUpdates ?? true }
     var countVisible: Bool { showCount ?? true }
     var receiveBetaEnabled: Bool { receiveBeta ?? false }
+    var hideUnknownEnabled: Bool { hideUnknown ?? true }
+    var hideFailedEnabled: Bool { hideFailed ?? true }
 }
 
 struct Store: Codable {
