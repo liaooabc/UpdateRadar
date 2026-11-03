@@ -8,7 +8,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var popover: NSPopover?
     private let service = UpdateService()
     private let updater = SelfUpdater()
-    private lazy var settingsController = SettingsWindowController(service: service, updater: updater)
     private let ui = UIState()
     private var cancellable: AnyCancellable?
     private var bobCancellable: AnyCancellable?
@@ -39,7 +38,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.imagePosition = .imageLeading
             button.target = self
             button.action = #selector(handleClick(_:))
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
+            button.sendAction(on: [.leftMouseUp])
         }
 
         buildMainMenu()
@@ -52,12 +51,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Task { @MainActor in
                 self?.removePanelKeyMonitor()
                 self?.removeOutsideClickMonitor()
+                // 面板关掉就回到列表页：下次点开应该先看到更新，而不是停在设置里
+                self?.ui.showSettings = false
                 self?.updateBadge()
             }
         }
 
         Notifier.shared.setup()
-        Notifier.shared.onOpen = { [weak self] in self?.showPanel() }
+        Notifier.shared.onOpen = { [weak self] appId in
+            self?.showPanel()
+            // 面板弹出来以后再让列表定位，不然 SwiftUI 还没渲染完，scrollTo 会落空
+            if let appId {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+                    NotificationCenter.default.post(name: .urRevealRow, object: appId)
+                }
+            }
+        }
 
         // 调试用：UPDATERADAR_RIPPLE_ALWAYS=1 一直荡波，用来单量这段动画本身的开销
         if ProcessInfo.processInfo.environment["UPDATERADAR_RIPPLE_ALWAYS"] != nil {
@@ -121,14 +130,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if env["UPDATERADAR_SHOW_SETTINGS"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showSettings() }
         }
+        // 调试用：UPDATERADAR_SETTINGS_PAGE=1 让面板直接停在设置页（截图核对排版）
+        if env["UPDATERADAR_SETTINGS_PAGE"] != nil { ui.showSettings = true }
+        // 调试用：UPDATERADAR_SHOW_PANEL=1 直接弹出列表页（配合 UPDATERADAR_PIN_PANEL 截图）
+        if env["UPDATERADAR_SHOW_PANEL"] != nil {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.showPanel() }
+        }
         if env["UPDATERADAR_SHOW_ABOUT"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showAbout() }
-        }
-        if env["UPDATERADAR_SHOW_MENU"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                NSApp.activate(ignoringOtherApps: true)
-                self?.showStatusMenu()
-            }
         }
         // 调试用：UPDATERADAR_SET_BETA=0/1 起来 4 秒后按下/松开「接收测试版」开关，
         // 用来看「切开关只重查受影响的 App」这条路径
@@ -148,6 +157,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let path = env["UPDATERADAR_SNAPSHOT"] {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
                 self?.writeSnapshot(to: path)
+            }
+        }
+        // 调试用：把真正弹出来的面板窗口抓一张（材质/毛玻璃只有在真窗口里才画得出来）
+        if let path = env["UPDATERADAR_SNAPSHOT_PANEL"] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                self?.showPanel()
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { [weak self] in
+                self?.writePanelSnapshot(to: path)
             }
         }
         if env["UPDATERADAR_TEST_NOTIFY"] != nil {
@@ -171,8 +189,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         pop.animates = true
         let host = NSHostingController(rootView: ContentView(service: service, ui: ui,
-                                                             onOpenSettings: { [weak self] in
-                                                                 self?.showSettings()
+                                                             updater: updater,
+                                                             onOpenAbout: { [weak self] in
+                                                                 self?.showAbout()
+                                                             },
+                                                             onQuit: {
+                                                                 NSApp.terminate(nil)
                                                              }))
         pop.contentViewController = host
         pop.contentSize = panelSize
@@ -181,10 +203,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 设置
 
-    /// 面板收起、窗口浮上来。设置窗口是独立窗口，打开时不必再留在面板里。
+    /// 设置不再单开窗口：不显示的先把面板弹出来，再把内容翻到设置页。
     private func showSettings() {
-        hidePanel()
-        settingsController.show()
+        if popover?.isShown != true { showPanel() }
+        // 面板刚弹出时 SwiftUI 还没建好视图，等一拍再翻页，动画才看得见
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
+            self?.ui.showSettings = true
+        }
     }
 
     /// 一句极简主菜单：只是为了让 ⌘, 和 ⌘Q 有地方挂。
@@ -342,11 +367,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 把面板离屏渲染成 PNG，用于截图核对界面（锁屏也照样能出图）
     private func writeSnapshot(to path: String) {
-        let host = NSHostingView(rootView: ContentView(service: service, ui: ui))
+        let host = NSHostingView(rootView: ContentView(service: service, ui: ui, updater: updater))
         host.frame = NSRect(origin: .zero, size: panelSize)
         host.layoutSubtreeIfNeeded()
         guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
         host.cacheDisplay(in: host.bounds, to: rep)
+        if let data = rep.representation(using: .png, properties: [:]) {
+            try? data.write(to: URL(fileURLWithPath: path))
+        }
+        NSApp.terminate(nil)
+    }
+
+    /// 把真正弹出来的面板窗口抓成 PNG（材质只有挂在真窗口里才画得出来）
+    private func writePanelSnapshot(to path: String) {
+        guard let view = popover?.contentViewController?.view,
+              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+        view.cacheDisplay(in: view.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {
             try? data.write(to: URL(fileURLWithPath: path))
         }
@@ -482,7 +518,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/UpdateRadarMenuBar.svg）：
         // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
         //
-        // 尺寸：SVG 的外框是 22，圆环只占 17.2/22。按 20.5pt 画出来圆环是 16pt，
+        // 尺寸：SVG 的外框是 22，方框只占 15.2+描边/22。按 20.5pt 画出来方框是 16pt，
         // 跟 Wi‑Fi、电池这类系统图标并排时高度一致；按 22pt 画会高出一头。
         let assetSide: CGFloat = 20.5
         if let asset = NSImage(named: "UpdateRadarMenuBar")?.copy() as? NSImage {
@@ -500,11 +536,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cy = side / 2
 
             let ringInset: CGFloat = 1.1
-            let ring = NSBezierPath(ovalIn: NSRect(x: ringInset, y: ringInset,
-                                                   width: side - ringInset * 2,
-                                                   height: side - ringInset * 2))
-            ring.lineWidth = 1.6
-            ring.stroke()
+            // 外框是圆角方框（跟 asset 里的 SVG 一致），弧度取边长 38%
+            let frameRect = NSRect(x: ringInset, y: ringInset,
+                                   width: side - ringInset * 2,
+                                   height: side - ringInset * 2)
+            let frame = NSBezierPath(roundedRect: frameRect,
+                                     xRadius: frameRect.width * 0.38,
+                                     yRadius: frameRect.height * 0.38)
+            frame.lineWidth = 1.6
+            frame.stroke()
 
             let shaftW: CGFloat = 2.8
             let shaft = NSRect(x: cx - shaftW / 2, y: cy - 1.6, width: shaftW, height: 6.4)
@@ -528,51 +568,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - 点击
 
     @objc private func handleClick(_ sender: Any?) {
-        let event = NSApp.currentEvent
-        if event?.type == .rightMouseUp || (event?.modifierFlags.contains(.control) ?? false) {
+        // 右键菜单取消：设置 / 关于 / 退出都搬到了面板底栏，菜单栏图标只剩「开/关面板」。
+        if popover?.isShown == true {
             hidePanel()
-            showStatusMenu()
         } else {
-            if popover?.isShown == true {
-                hidePanel()
-            } else {
-                showPanel()
-                if service.lastCheck == nil { service.checkAll() }
-            }
+            showPanel()
+            if service.lastCheck == nil { service.checkAll() }
         }
         updateBadge()
-    }
-
-    // MARK: - 右键菜单
-
-    /// 右键菜单（用户定稿 2026-10-26）：关于 / 设置 / 检测更新 / 退出。
-    /// 检测频率、菜单栏显示数量、通知开关都搬进设置窗口了，菜单里不再重复。
-    private func showStatusMenu() {
-        let menu = NSMenu()
-        menu.autoenablesItems = false
-
-        let about = NSMenuItem(title: "关于", action: #selector(showAbout), keyEquivalent: "")
-        about.target = self
-        menu.addItem(about)
-
-        let settings = NSMenuItem(title: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
-        settings.target = self
-        menu.addItem(settings)
-
-        menu.addItem(.separator())
-
-        let check = NSMenuItem(title: "检测更新", action: #selector(checkNow), keyEquivalent: "r")
-        check.target = self
-        check.isEnabled = !service.checking
-        menu.addItem(check)
-
-        let quit = NSMenuItem(title: "退出", action: #selector(quitApp), keyEquivalent: "q")
-        quit.target = self
-        menu.addItem(quit)
-
-        statusItem.menu = menu
-        statusItem.button?.performClick(nil)
-        statusItem.menu = nil
     }
 
     /// 关于面板交给系统画（orderFrontStandardAboutPanel）：
@@ -609,10 +612,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .credits: credits
         ])
         NSApp.activate(ignoringOtherApps: true)
-    }
-
-    @objc private func checkNow() {
-        service.rescan(thenCheck: true, force: true)
     }
 
     @objc private func quitApp() { NSApp.terminate(nil) }

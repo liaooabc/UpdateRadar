@@ -508,7 +508,8 @@ enum Cask {
 
     /// cask 的 uninstall 段里写着「卸载时要退出的 bundle id」（如 notion.id），
     /// 拿它反查这到底是哪个 App。只看 uninstall：zap/trash 里混着路径，会误判。
-    private static func bundleIds(in obj: [String: Any]) -> Set<String> {
+    /// （不是 private：回归测试要直接调。）
+    static func bundleIds(in obj: [String: Any]) -> Set<String> {
         var ids: Set<String> = []
         func walk(_ o: Any) {
             if let d = o as? [String: Any] { d.values.forEach(walk) }
@@ -518,7 +519,10 @@ enum Cask {
                     let t = String(part)
                     let dots = t.filter { $0 == "." }.count
                     let clean = t.allSatisfy { $0.isLetter || $0.isNumber || $0 == "." || $0 == "-" }
-                    if dots >= 2, clean, !t.hasSuffix(".plist"), !t.hasSuffix(".app") {
+                    // dots >= 2 已经把「Notion.app」这种文件名挡在外面（它只有一个点），
+                    // 所以不能再按 .app 结尾过滤：cn.trae.app 这种**真 bundle id 就以 .app 结尾**，
+                    // 滤掉它，cask-map 里就永远缺这一条（Trae CN 当初就是这么漏的）。
+                    if dots >= 2, clean, !t.hasSuffix(".plist") {
                         ids.insert(t)
                     }
                 }
@@ -558,7 +562,8 @@ enum Cask {
     }
 
     /// 1.2.3,456 → 1.2.3；3.6.7-dbc92f97 → 3.6.7；2026.3.1 原样
-    private static func cleanVersion(_ raw: String) -> String? {
+    /// （不是 private：回归测试要直接调。）
+    static func cleanVersion(_ raw: String) -> String? {
         var v = raw.split(separator: ",").first.map(String.init) ?? raw
         v = v.trimmingCharacters(in: .whitespaces)
         // 只在后缀是「构建号 / commit」这种形态时才截断。4.0.0-beta.1 这类是**预发布版本号**，

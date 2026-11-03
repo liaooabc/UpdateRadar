@@ -19,12 +19,14 @@ enum Scanner {
                 options: [.skipsHiddenFiles, .skipsPackageDescendants]
             ) else { continue }
 
-            // 只下钻两层：/Applications/X.app 与 /Applications/Adobe X/Y.app。
-            // 深度已经限死，递归不会爆，不需要再挂一个全局条目计数器当熔断
+            // 下钻四层：/Applications/X.app（1）、Adobe 套件的 /Applications/Adobe X/Y.app（2），
+            // 以及 Setapp、DaVinci Resolve 这类「厂商目录/子目录/App」的三层结构，多留一层余量。
+            // 深度限死后递归不会爆，不需要再挂一个全局条目计数器当熔断
             // （那种计数一旦撞上限，排在后面的 App 会被整批丢掉）。
+            // .app 是 bundle，skipsPackageDescendants 本来就不会钻进去，四层只是多扫几个空目录。
             for case let url as URL in e {
                 let rel = url.path.replacingOccurrences(of: root + "/", with: "")
-                if rel.components(separatedBy: "/").count > 2 {
+                if rel.components(separatedBy: "/").count > 4 {
                     e.skipDescendants()
                     continue
                 }

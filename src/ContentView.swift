@@ -10,6 +10,9 @@ extension Notification.Name {
     /// 必须走通知：NSTextField 正在编辑时，SwiftUI 的 binding 回写到不了编辑器里，
     /// 不清掉编辑器里的字，界面就会和 ui.query 对不上。
     static let updateRadarSetSearch = Notification.Name("UpdateRadarSetSearch")
+
+    /// 点更新通知后传过来的 App id：列表翻到「可更新」并定位到那一行。
+    static let urRevealRow = Notification.Name("URRevealRow")
 }
 
 /// 界面自身的小状态。用 ObservableObject 而不是 @State，因为这台机器只有
@@ -37,6 +40,10 @@ final class UIState: ObservableObject {
 
     /// 搜索框是不是正在编辑：决定要不要把「最近搜索」列出来
     @Published var searchActive = false
+    /// 分段轨道整条的宽度（搜索框宽度取它的一半）。0 = 还没量到
+    @Published var tabTrackWidth: CGFloat = 0
+    /// 面板当前显示的是设置页（点齿轮翻过去，点「返回」翻回来）
+    @Published var showSettings = false
     /// 最近搜索过的关键词，最新的在前，最多 5 条
     @Published var recentSearches: [String] =
         UserDefaults.standard.stringArray(forKey: recentKey) ?? []
@@ -119,8 +126,12 @@ final class HoverStore {
 struct ContentView: View {
     @ObservedObject var service: UpdateService
     @ObservedObject var ui: UIState
-    /// 底栏齿轮：打开设置窗口（窗口由 AppDelegate 持有）
-    var onOpenSettings: () -> Void = {}
+    /// 设置页要显示本软件的版本和自更新状态
+    @ObservedObject var updater: SelfUpdater
+    /// 底栏「•••」：关于面板
+    var onOpenAbout: () -> Void = {}
+    /// 底栏「⏻」：退出
+    var onQuit: () -> Void = {}
 
     /// 「可更新」页的行：只列有新版本的，按名字排
     private var visibleRows: [AppRow] {
@@ -173,11 +184,83 @@ struct ContentView: View {
         // 行能从条底下穿过去，条自己那层 ultraThinMaterial 把穿过的那几行糊掉，
         // 再叠上 macOS 26 的滚动边缘效果，滑到边上的内容就有一段渐隐，这就是透视感。
         // 老系统没有那条系统 API，纯靠材质兜底，效果弱一点但不会破。
+        // 设置不再是独立窗口：点齿轮后内容横向翻过去，翻回来时列表从左边推回来。
+        ZStack {
+            if ui.showSettings {
+                settingsPage
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .trailing).combined(with: .opacity),
+                        removal: .move(edge: .trailing).combined(with: .opacity)
+                    ))
+            } else {
+                listPage
+                    .transition(.asymmetric(
+                        insertion: .move(edge: .leading).combined(with: .opacity),
+                        removal: .move(edge: .leading).combined(with: .opacity)
+                    ))
+            }
+        }
+        .frame(width: 364, height: 548)
+        .clipped()
+        .animation(.snappy(duration: 0.26), value: ui.showSettings)
+        // 不铺不透明底色：让 NSPopover 自己的液态玻璃材质透过来
+    }
+
+    private var listPage: some View {
         list
             .safeAreaInset(edge: .top, spacing: 0) { topBar }
             .safeAreaInset(edge: .bottom, spacing: 0) { footer }
-            .frame(width: 364, height: 548)
-        // 不铺不透明底色：让 NSPopover 自己的液态玻璃材质透过来
+    }
+
+    // MARK: - 设置页
+
+    private var settingsPage: some View {
+        // 设置页不用「内容从底栏底下穿过去」那套：这里行比较密，穿过去会糊成一团。
+        // 直接把滚动区和底栏分成上下两块，内容滚到底就停在底栏上方。
+        VStack(spacing: 0) {
+            ScrollView {
+                PanelSettingsView(service: service, updater: updater)
+            }
+            .scrollIndicators(.never)
+            .modifier(ScrollEdgeBlur())
+
+            settingsFooter
+        }
+    }
+
+    /// 设置页的底栏：返回 · 版本号 · 关于 · 退出（跟参考图同一套排列）。
+    /// 返回用文字胶囊，右边两颗圆钮仍然交给系统玻璃。
+    private var settingsFooter: some View {
+        HStack(spacing: 8) {
+            Button {
+                ui.showSettings = false
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.left")
+                        .font(.system(size: 10, weight: .semibold))
+                    Text("返回")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .padding(.horizontal, 12)
+                .frame(height: 26)
+                .contentShape(Capsule())
+                .modifier(GlassCapsule())
+            }
+            .buttonStyle(.plain)
+            .help("回到更新列表")
+
+            Text("版本 \(updater.currentVersion)")
+                .font(.system(size: 10.5))
+                .monospacedDigit()
+                .foregroundStyle(.secondary)
+
+            Spacer(minLength: 0)
+
+            footerButton("ellipsis", help: "关于") { onOpenAbout() }
+            footerButton("power", help: "退出更新雷达") { onQuit() }
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 8)
     }
 
     private var topBar: some View {
@@ -205,20 +288,24 @@ struct ContentView: View {
             .coordinateSpace(name: "tabTrack")
             .background(alignment: .topLeading) { tabPreview }
             .onPreferenceChange(TabFrameKey.self) { ui.tabFrames = $0 }
+            .background {
+                GeometryReader { geo in
+                    Color.clear.preference(key: TrackWidthKey.self, value: geo.size.width)
+                }
+            }
+            .onPreferenceChange(TrackWidthKey.self) { ui.tabTrackWidth = $0 }
             .modifier(GlassTrack())
 
             Spacer(minLength: 0)
 
-            // 搜索框常驻：原来只在「其他」页签出现，切到「可更新」就消失，
-            // 想搜个名字还得先换页。现在两个页签下都在，⌘F 也随时能落到它上面。
-            // 尺寸/字号必须跟左边那条轨道一模一样：同一个高度、同一个正文字号，
-            // 只靠 padding 凑容易差 2pt，所以两边都写死高度。
+            // 搜索框常驻：两个页签下都在，⌘F 随时能落到它上面。
+            // 宽度跟右下三颗圆钮那一排同宽（26×3 + 间距 8×2 = 94），右边缘齐平。
             HStack(spacing: 5) {
                 Image(systemName: "magnifyingglass")
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
                 SearchField(ui: ui)
-                    .frame(width: 64)
+                    .frame(maxWidth: .infinity)
                 // 清除按钮的位置常驻（没字的时候只是透明）：一出现一消失，
                 // 整条胶囊的宽度就会跟着跳一下，段落轨道也会跟着挤。
                 Button {
@@ -234,7 +321,7 @@ struct ContentView: View {
                 .help("清除搜索")
             }
             .padding(.horizontal, 10)
-            .frame(height: Self.barControlHeight)
+            .frame(width: Self.barControlHeight * 3 + 16, height: Self.barControlHeight)
             .modifier(GlassSearchField())
         }
         .padding(.horizontal, 14)
@@ -386,6 +473,7 @@ struct ContentView: View {
                         LazyVStack(spacing: 0) {
                             Color.clear.frame(height: 0).id("top")
                             if ui.tab == 0 {
+                                if visibleRows.count > 1 { updateAllHeader }
                                 rowsSection(visibleRows)
                             } else {
                                 ForEach(Array(rowGroups.enumerated()), id: \.element.key) { index, group in
@@ -441,6 +529,37 @@ struct ContentView: View {
             }
         }
         .frame(maxHeight: .infinity)
+        // 点更新通知：翻到「可更新」页，把那一行滚到中间并套上焦点框
+        .onReceive(NotificationCenter.default.publisher(for: .urRevealRow)) { note in
+            guard let id = note.object as? String else { return }
+            ui.tab = 0
+            // 等页签切换渲染完再滚
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                ui.keyRow = id
+            }
+        }
+    }
+
+    /// 「可更新」页顶上的组头：左边标题和数量，右边「全部更新」一次打开所有更新页。
+    /// 样式跟「其他」页的组头对齐，只是不能折叠（折叠按钮在别的页才有意义）。
+    private var updateAllHeader: some View {
+        HStack(spacing: 5) {
+            Text("可更新")
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Text("\(visibleRows.count)")
+                .font(.footnote)
+                .monospacedDigit()
+                .foregroundStyle(.tertiary)
+            Spacer(minLength: 0)
+            Button("全部更新") { service.openAllUpdates() }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .padding(.leading, 12)
+        .padding(.trailing, 18)
+        .padding(.top, 10)
+        .padding(.bottom, 4)
     }
 
     @ViewBuilder
@@ -519,22 +638,39 @@ struct ContentView: View {
     // MARK: - 底栏
 
     private var footer: some View {
-        // 底栏只留两颗按钮。原来那句「共 N 个 App · N 个暂无检测源 · 18:47 检测」删了：
-        // 底栏现在是透明的，行要从底下穿过去，文字压在上面翻来翻去永远看不清。
-        // 这三样信息也都有正经去处——App 总数看两个页签的数字，无检测源的条数在「其他」
-        // 页里就是一个分组，上次检测时间在设置窗口「上次检测」那一行。
-        // Apple 自己的弹层底部也很少放状态文字，留一排控件更干净。
+        // 右键菜单已经取消，原来的「关于 / 设置 / 检测更新 / 退出」全搬到底栏：
+        // 左下扫描（带文字），右下三颗玻璃圆：关于、设置、退出。
         HStack(spacing: 8) {
+            // 扫描放左下（用户指定位置），带文字；宽度取「可更新 / 其他」整条轨道的一半。
+            // 扫描中文字变「扫描中」并显示系统转圈
+            Button {
+                service.rescan(thenCheck: true, force: true)
+            } label: {
+                HStack(spacing: 5) {
+                    if service.checking {
+                        NativeSpinner().frame(width: 12, height: 12)
+                    } else {
+                        Image(systemName: "arrow.triangle.2.circlepath")
+                            .font(.system(size: 11, weight: .medium))
+                    }
+                    Text(service.checking ? "扫描中" : "扫描")
+                        .font(.system(size: 12, weight: .medium))
+                }
+                .frame(width: ui.tabTrackWidth > 0 ? ui.tabTrackWidth / 2 : 100,
+                       height: 26)
+                .contentShape(Capsule())
+                .modifier(GlassCapsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(service.checking)
+            .help(service.checking ? "正在扫描" : "立即扫描")
+
             Spacer()
 
-            footerButton("arrow.triangle.2.circlepath",
-                         spinning: service.checking,
-                         help: service.checking ? "正在扫描" : "立即扫描") {
-                service.rescan(thenCheck: true, force: true)
-            }
-            .disabled(service.checking)
-
-            footerButton("gearshape", help: "设置") { onOpenSettings() }
+            // 「关于 → 设置 → 退出」的顺序（设置夹在中间）
+            footerButton("ellipsis", help: "关于") { onOpenAbout() }
+            footerButton("gearshape", help: "设置") { ui.showSettings = true }
+            footerButton("power", help: "退出更新雷达") { onQuit() }
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 8)
@@ -564,6 +700,14 @@ private struct TabFrameKey: PreferenceKey {
     static var defaultValue: [Int: CGRect] = [:]
     static func reduce(value: inout [Int: CGRect], nextValue: () -> [Int: CGRect]) {
         value.merge(nextValue(), uniquingKeysWith: { $1 })
+    }
+}
+
+/// 分段轨道整条的宽度：搜索框要按它的一半算
+private struct TrackWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
     }
 }
 
@@ -616,7 +760,7 @@ private struct GlassIcon: View {
                     .font(.callout.weight(.medium))
             }
         }
-        .frame(width: 28, height: 28)
+        .frame(width: 26, height: 26)
         .contentShape(Circle())
         .modifier(GlassCircle())
     }
@@ -651,6 +795,19 @@ private struct GlassCircle: ViewModifier {
             content
                 .background(Circle().fill(Color.primary.opacity(0.06)))
                 .overlay(Circle().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
+        }
+    }
+}
+
+/// 圆角玻璃胶囊（底栏「扫描」带文字那顆）：和 GlassCircle 同一套系统玻璃
+private struct GlassCapsule: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 26.0, *) {
+            content.glassEffect(.regular.interactive(), in: .capsule)
+        } else {
+            content
+                .background(Capsule().fill(Color.primary.opacity(0.06)))
+                .overlay(Capsule().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
         }
     }
 }

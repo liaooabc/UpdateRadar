@@ -9,7 +9,8 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
 
     private var granted = false
     private var asked = false
-    var onOpen: (() -> Void)?
+    /// 点通知后的回调；appId 非空时面板应定位到那一行
+    var onOpen: ((_ appId: String?) -> Void)?
 
     /// 系统里真实的授权状态。设置页要显示它，否则开关和实际行为会脱节
     @Published private(set) var authorization: UNAuthorizationStatus = .notDetermined
@@ -41,12 +42,13 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
         }
     }
 
-    func post(title: String, body: String, id: String) {
+    func post(title: String, body: String, id: String, userInfo: [AnyHashable: Any] = [:]) {
         guard granted else { return }
         let content = UNMutableNotificationContent()
         content.title = title
         content.body = body
         content.sound = .default
+        content.userInfo = userInfo
         let request = UNNotificationRequest(identifier: id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
     }
@@ -62,8 +64,9 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter,
                                             didReceive response: UNNotificationResponse,
                                             withCompletionHandler completionHandler: @escaping () -> Void) {
+        let appId = response.notification.request.content.userInfo["appId"] as? String
         Task { @MainActor in
-            Notifier.shared.onOpen?()
+            Notifier.shared.onOpen?(appId)
         }
         completionHandler()
     }
