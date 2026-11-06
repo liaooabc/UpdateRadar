@@ -714,12 +714,6 @@ enum Checker {
         return best
     }
 
-    /// 有说明就接在后面，别覆盖掉原来的理由
-    private static func mergeNotes(_ note: String?, _ extra: String) -> String {
-        guard let note, !note.isEmpty else { return extra }
-        return note + "；" + extra
-    }
-
     /// 商店之外的检测源：厂商规则 → Sparkle appcast → Homebrew Cask
     private static func checkOtherSources(_ app: InstalledApp, previous: CheckResult?,
                                           allowBeta: Bool) async -> CheckResult {

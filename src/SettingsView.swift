@@ -7,7 +7,6 @@ import SwiftUI
 /// 卡片用系统的 `glassEffect`，所以「降低透明度 / 增强对比度」照样作用到它身上。
 struct PanelSettingsView: View {
     @ObservedObject var service: UpdateService
-    @ObservedObject var updater: SelfUpdater
     @ObservedObject private var notifier = Notifier.shared
     @ObservedObject private var launchAtLogin = LaunchAtLogin.shared
     /// 分组标题不在玻璃卡片里，纯靠 vibrancy 拿色会在弹层里偏淡；按明暗模式给个固定色
@@ -54,11 +53,6 @@ struct PanelSettingsView: View {
         case .notDetermined: return "尚未询问"
         @unknown default: return "状态未知"
         }
-    }
-
-    private var releasePageURL: URL? {
-        if case let .available(_, _, page, _) = updater.phase { return URL(string: page) }
-        return nil
     }
 
     var body: some View {
@@ -146,43 +140,7 @@ struct PanelSettingsView: View {
                 }
             }
 
-            section("更新雷达") {
-                SettingRow(symbol: "app.badge", title: "当前版本") {
-                    HStack(spacing: 8) {
-                        Text(updater.currentVersion)
-                            .font(.system(size: 12, weight: .medium))
-                        if let page = releasePageURL {
-                            Button("发布说明") { NSWorkspace.shared.open(page) }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                        } else {
-                            Button("检查更新") { updater.check() }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                                .disabled(updater.isChecking)
-                        }
-                    }
-                }
-                if case let .available(version, downloadURL, _, hasDMG) = updater.phase {
-                    SettingRow(symbol: "square.and.arrow.down", title: "安装 \(version)") {
-                        if hasDMG {
-                            ConfirmingButton(
-                                title: "更新并重启",
-                                dialogTitle: "现在下载并安装 \(version)？",
-                                confirmTitle: "更新并重启",
-                                message: "会下载安装包、替换当前 App，然后自动重新打开。"
-                            ) {
-                                updater.install(version: version, downloadURL: downloadURL)
-                            }
-                            .controlSize(.small)
-                        } else if let url = URL(string: downloadURL) {
-                            Button("下载") { NSWorkspace.shared.open(url) }
-                                .buttonStyle(.bordered)
-                                .controlSize(.small)
-                        }
-                    }
-                }
-            }
+            // 「更新雷达」分组（当前版本 + 检查更新 / 安装）已搬到关于页，这里不再重复
         }
         .padding(.horizontal, 14)
         .padding(.top, 4)
@@ -264,8 +222,8 @@ private struct SettingRow<Trailing: View>: View {
     }
 }
 
-/// 设置卡片的底：一层很薄的系统玻璃 + 圆角
-private struct SettingsCard: ViewModifier {
+/// 设置卡片的底：一层很薄的系统玻璃 + 圆角。关于页也复用这一层，保证两页观感一致
+struct SettingsCard: ViewModifier {
     func body(content: Content) -> some View {
         if #available(macOS 26.0, *) {
             content.glassEffect(.regular, in: .rect(cornerRadius: 12))
@@ -278,11 +236,12 @@ private struct SettingsCard: ViewModifier {
 /// 带确认的按钮：批量、会打断手上的工作这类操作，先弹一句系统确认。
 /// 「问过没」存在一个小 ObservableObject 里，而不是 @State：
 /// 本机是 Command Line Tools，shim 里没有 SwiftUI 的宏插件，@State 编不过。
-private final class ConfirmState: ObservableObject {
+/// 关于页也复用它（安装更新），所以不设 private。
+final class ConfirmState: ObservableObject {
     @Published var asking = false
 }
 
-private struct ConfirmingButton: View {
+struct ConfirmingButton: View {
     let title: String
     let dialogTitle: String
     let confirmTitle: String

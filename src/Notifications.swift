@@ -15,8 +15,6 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     /// 系统里真实的授权状态。设置页要显示它，否则开关和实际行为会脱节
     @Published private(set) var authorization: UNAuthorizationStatus = .notDetermined
 
-    var isAuthorized: Bool { granted }
-
     func setup() {
         let center = UNUserNotificationCenter.current()
         center.delegate = self

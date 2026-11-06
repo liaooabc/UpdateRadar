@@ -2,10 +2,29 @@ import AppKit
 import Combine
 import SwiftUI
 
+/// 面板窗口。无边框窗口默认当不了 key window，方向键 / Return 就收不到，所以放开。
+final class PanelWindow: NSPanel {
+    var fixedSize: NSSize?
+
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { false }
+
+    override func setFrame(_ frameRect: NSRect, display flag: Bool) {
+        var rect = frameRect
+        if let fixedSize { rect.size = fixedSize }
+        super.setFrame(rect, display: flag)
+    }
+
+    override func setContentSize(_ size: NSSize) {
+        super.setContentSize(fixedSize ?? size)
+    }
+}
+
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var popover: NSPopover?
+    private var panel: PanelWindow?
+    private var panelHost: NSView?
     private let service = UpdateService()
     private let updater = SelfUpdater()
     private let ui = UIState()
@@ -17,6 +36,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var keyMonitor: Any?
     /// 面板开着时的全局鼠标监听：点别的 App 的任何地方都收掉面板
     private var outsideClickMonitor: Any?
+    /// 菜单栏图标在屏幕上的范围（弹出面板时缓存）。点它时既要弹面板又要能收面板，
+    /// 所以「点图标」不能被当成「点别处」：应用失活、全局点击两条收起路径都要放行。
+    private var statusItemRect: NSRect = .zero
 
     // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
     // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
@@ -26,9 +48,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private static let rippleStart: CGFloat = 6.4     // 从环的内沿起
     private static let rippleEnd: CGFloat = 11.2      // 扩到框边（22pt 的图标里环外径 8.6）
     private static let ripplePeriod: CFTimeInterval = 1.6
-    static let iconInnerRadius: CGFloat = 6.3             // 环的内沿（22pt 图里环外径 17.2、线宽 2 → 内径 6.6）
 
     private let panelSize = NSSize(width: 364, height: 548)
+    /// NSPopover 的 contentSize 就是整块玻璃的大小，内容直接铺满；
+    /// 自建面板也照这个来，窗口 = 内容 364×548，不能额外留内边距，
+    /// 否则面板会整体变大、控件相对边缘的位置全被推到里面去。
+    private let panelPadding: CGFloat = 0
+    private var panelWindowSize: NSSize {
+        NSSize(width: panelSize.width + panelPadding * 2, height: panelSize.height + panelPadding * 2)
+    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
@@ -42,20 +70,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         buildMainMenu()
-        buildPopover()
-
-        // 面板开着的时候别弹"全部都是最新的"这种悬停提示，会盖在面板上
-        NotificationCenter.default.addObserver(
-            forName: NSPopover.didCloseNotification, object: nil, queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in
-                self?.removePanelKeyMonitor()
-                self?.removeOutsideClickMonitor()
-                // 面板关掉就回到列表页：下次点开应该先看到更新，而不是停在设置里
-                self?.ui.showSettings = false
-                self?.updateBadge()
-            }
-        }
+        buildPanel()
 
         Notifier.shared.setup()
         Notifier.shared.onOpen = { [weak self] appId in
@@ -132,12 +147,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // 调试用：UPDATERADAR_SETTINGS_PAGE=1 让面板直接停在设置页（截图核对排版）
         if env["UPDATERADAR_SETTINGS_PAGE"] != nil { ui.showSettings = true }
+        // 调试用：UPDATERADAR_ABOUT_PAGE=1 让面板直接停在关于页（截图核对排版）
+        if env["UPDATERADAR_ABOUT_PAGE"] != nil { ui.showAbout = true }
         // 调试用：UPDATERADAR_SHOW_PANEL=1 直接弹出列表页（配合 UPDATERADAR_PIN_PANEL 截图）
         if env["UPDATERADAR_SHOW_PANEL"] != nil {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.showPanel() }
-        }
-        if env["UPDATERADAR_SHOW_ABOUT"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showAbout() }
         }
         // 调试用：UPDATERADAR_SET_BETA=0/1 起来 4 秒后按下/松开「接收测试版」开关，
         // 用来看「切开关只重查受影响的 App」这条路径
@@ -178,34 +192,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - 面板
 
-    /// 面板用系统自己的 NSPopover：材质、圆角、阴影、弹出动画全由 AppKit 负责，
-    /// 不会出现"自己画的圆角 + 露出来的直角底"那种事。
-    private func buildPopover() {
-        let pop = NSPopover()
-        pop.behavior = .transient          // 点别处 / 按 Esc 自动收起
-        // 调试用：UPDATERADAR_PIN_PANEL=1 时面板不自动收，方便 screencapture 核对长相
-        if ProcessInfo.processInfo.environment["UPDATERADAR_PIN_PANEL"] != nil {
-            pop.behavior = .applicationDefined
+    /// 参考 status-trio 的做法：不用 NSPopover，自己开一个无边框 NSPanel，
+    /// 背景交给系统玻璃视图。这样就没有顶部的小三角，材质、圆角、阴影仍然是系统的。
+    private func buildPanel() {
+        let win = PanelWindow(contentRect: NSRect(origin: .zero, size: panelWindowSize),
+                              styleMask: [.borderless, .nonactivatingPanel],
+                              backing: .buffered, defer: false)
+        win.isFloatingPanel = true
+        win.level = .statusBar
+        win.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
+        win.isOpaque = false
+        win.backgroundColor = .clear
+        win.hasShadow = true
+        win.isReleasedWhenClosed = false
+        win.hidesOnDeactivate = false
+        win.becomesKeyOnlyIfNeeded = false
+        win.animationBehavior = .none
+        win.fixedSize = panelWindowSize
+
+        let controller = NSHostingController(rootView: ContentView(service: service, ui: ui,
+                                                                   updater: updater,
+                                                                   onQuit: {
+                                                                       NSApp.terminate(nil)
+                                                                   }))
+        let hostView = controller.view
+        hostView.frame = NSRect(x: panelPadding, y: panelPadding,
+                                width: panelSize.width, height: panelSize.height)
+        hostView.translatesAutoresizingMaskIntoConstraints = true
+
+        // 最外层容器负责圆角裁切：窗口的阴影是照着内容的轮廓画的，
+        // 只让玻璃自己圆角的话，四角会露出一圈窗口阴影，看上去就是几条黑边
+        let container = NSView(frame: NSRect(origin: .zero, size: panelWindowSize))
+        container.wantsLayer = true
+        container.layer?.cornerRadius = 16
+        container.layer?.masksToBounds = true
+
+        if #available(macOS 26.0, *) {
+            let glass = NSGlassEffectView(frame: container.bounds)
+            glass.style = .regular
+            glass.cornerRadius = 16
+            glass.autoresizingMask = [.width, .height]
+            // 关键：中间隔一层普通容器。hosting view 直接塞进 glass.contentView，
+            // 它会按自己的固有尺寸反向撑坏窗口和玻璃的分层渲染
+            let glassHost = NSView(frame: glass.bounds)
+            glassHost.autoresizingMask = [.width, .height]
+            glassHost.addSubview(hostView)
+            glass.contentView = glassHost
+            container.addSubview(glass)
+        } else {
+            let effect = NSVisualEffectView(frame: container.bounds)
+            effect.material = .popover
+            effect.blendingMode = .behindWindow
+            effect.state = .active
+            effect.autoresizingMask = [.width, .height]
+            effect.addSubview(hostView)
+            container.addSubview(effect)
         }
-        pop.animates = true
-        let host = NSHostingController(rootView: ContentView(service: service, ui: ui,
-                                                             updater: updater,
-                                                             onOpenAbout: { [weak self] in
-                                                                 self?.showAbout()
-                                                             },
-                                                             onQuit: {
-                                                                 NSApp.terminate(nil)
-                                                             }))
-        pop.contentViewController = host
-        pop.contentSize = panelSize
-        popover = pop
+
+        win.contentView = container
+
+        panelHost = hostView
+        panel = win
     }
 
     // MARK: - 设置
 
     /// 设置不再单开窗口：不显示的先把面板弹出来，再把内容翻到设置页。
     private func showSettings() {
-        if popover?.isShown != true { showPanel() }
+        if panel?.isVisible != true { showPanel() }
         // 面板刚弹出时 SwiftUI 还没建好视图，等一拍再翻页，动画才看得见
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { [weak self] in
             self?.ui.showSettings = true
@@ -267,7 +321,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// ⌘F：面板没开就先弹出来，再把焦点交给搜索框
     @objc private func focusSearch() {
-        if popover?.isShown != true { showPanel() }
+        if panel?.isVisible != true { showPanel() }
         // 面板刚弹出时 SwiftUI 还没把搜索框建出来，等一拍再发
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             NotificationCenter.default.post(name: .updateRadarFocusSearch, object: nil)
@@ -277,22 +331,50 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func rescanFromMenu() { service.rescan() }
 
     private func showPanel() {
-        guard let popover, !popover.isShown, let button = statusItem.button else { return }
-        button.toolTip = nil
+        guard let panel, !panel.isVisible else { return }
+        statusItem.button?.toolTip = nil
+        positionPanel()
         NSApp.activate(ignoringOtherApps: true)
-        popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+        panel.alphaValue = 1
+        panel.orderFrontRegardless()
+        // 应用不是活跃状态时 makeKeyAndOrderFront 不一定能拿到 key，
+        // 单独再要一次，方向键、悬停反馈才有反应
+        panel.makeKey()
         installPanelKeyMonitor()
         installOutsideClickMonitor()
     }
 
+    /// 贴着菜单栏图标下沿 6pt、水平居中，左右夹在屏幕可见区域内
+    private func positionPanel() {
+        guard let panel, let button = statusItem.button, let buttonWindow = button.window else { return }
+        let rect = buttonWindow.convertToScreen(button.convert(button.bounds, to: nil))
+        // 放宽一圈：点到图标边缘的间隙也算「点图标」
+        statusItemRect = rect.insetBy(dx: -8, dy: -10)
+        let size = panelWindowSize
+        var x = rect.midX - size.width / 2
+        if let screen = buttonWindow.screen ?? NSScreen.main {
+            let visible = screen.visibleFrame
+            x = min(max(x, visible.minX + 8), visible.maxX - size.width - 8)
+        }
+        panel.setFrameOrigin(NSPoint(x: x, y: rect.minY - size.height - 6))
+    }
+
     private func hidePanel() {
-        popover?.performClose(nil)
+        guard let panel, panel.isVisible else { return }
+        panel.orderOut(nil)
+        // 面板关掉就回到列表页：下次点开应该先看到更新，而不是停在设置里
+        removePanelKeyMonitor()
+        removeOutsideClickMonitor()
+        // 关掉就回列表页：设置和关于都复位，否则下次点开还停在关于页
+        ui.showSettings = false
+        ui.showAbout = false
+        ui.aboutFromSettings = false
+        updateBadge()
     }
 
     // MARK: - 面板键盘
 
-    /// 只挂本地监视器：面板是 key window 时接管 ↑↓ / Return，其它情况原样放行。
-    /// 用 Esc 关面板交给 NSPopover 自己（transient 弹层默认就支持）。
+    /// 只挂本地监视器：面板是 key window 时接管 ↑↓ / Return / Esc，其它情况原样放行。
     private func installPanelKeyMonitor() {
         guard keyMonitor == nil else { return }
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -319,7 +401,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(
             matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]
         ) { [weak self] _ in
-            Task { @MainActor in self?.hidePanel() }
+            Task { @MainActor in
+                guard let self else { return }
+                // 点的是自己的菜单栏图标：交给 handleClick 去开/关，这里不当"外点"
+                if self.statusItemRect.contains(NSEvent.mouseLocation) { return }
+                self.hidePanel()
+            }
         }
     }
 
@@ -332,22 +419,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 返回 true 表示这枚按键已经吃掉，false 表示原样放行
     private func handlePanelKey(code: UInt16) -> Bool {
-        guard let popover, popover.isShown,
-              let window = popover.contentViewController?.view.window,
-              window.isKeyWindow else { return false }
+        guard let panel, panel.isVisible, panel.isKeyWindow else { return false }
         // 正在搜索框里打字：方向键要移光标、Return 什么也别做
-        if window.firstResponder is NSTextView { return false }
+        if panel.firstResponder is NSTextView { return false }
         switch code {
         case 126: moveKeyRow(-1); return true      // ↑
         case 125: moveKeyRow(1); return true       // ↓
         case 36, 76: activateKeyRow(); return true // Return / 小键盘 Enter
+        case 53: hidePanel(); return true          // Esc
         default: return false
         }
     }
 
     /// 行的顺序直接从布局里读：rowFrames 是按纵坐标记的，折叠、分组、换页签都不用另外算
     private func moveKeyRow(_ delta: Int) {
-        let ids = ui.rowFrames.sorted { $0.value.minY < $1.value.minY }.map(\.key)
+        let frames = ui.rowFramesByTab[ui.tab] ?? [:]
+        let ids = frames.sorted { $0.value.minY < $1.value.minY }.map(\.key)
         guard !ids.isEmpty else { return }
         let current = ui.keyRow.flatMap { ids.firstIndex(of: $0) }
         let start = current ?? (delta > 0 ? -1 : ids.count)
@@ -380,7 +467,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 把真正弹出来的面板窗口抓成 PNG（材质只有挂在真窗口里才画得出来）
     private func writePanelSnapshot(to path: String) {
-        guard let view = popover?.contentViewController?.view,
+        guard let view = panelHost,
               let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
         view.cacheDisplay(in: view.bounds, to: rep)
         if let data = rep.representation(using: .png, properties: [:]) {
@@ -569,7 +656,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func handleClick(_ sender: Any?) {
         // 右键菜单取消：设置 / 关于 / 退出都搬到了面板底栏，菜单栏图标只剩「开/关面板」。
-        if popover?.isShown == true {
+        if panel?.isVisible == true {
             hidePanel()
         } else {
             showPanel()
@@ -578,50 +665,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         updateBadge()
     }
 
-    /// 关于面板交给系统画（orderFrontStandardAboutPanel）：
-    /// 图标尺寸、名称字号、版本行、版权、credits 的排版和间距都是 macOS 自己的规范，
-    /// 深浅色、Liquid Glass、窗口尺寸随系统一起变，不用自己跟着每个大版本重画。
-    @objc private func showAbout() {
-        let short = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
-        let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-
-        let body: [NSAttributedString.Key: Any] = [
-            .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-            .foregroundColor: NSColor.secondaryLabelColor
-        ]
-        let credits = NSMutableAttributedString(
-            string: "扫描本机 App，有新版就提醒你。数据只存在本机。\n",
-            attributes: body
-        )
-        if let url = URL(string: "https://github.com/liaooabc/UpdateRadar/issues") {
-            credits.append(NSAttributedString(string: "反馈问题", attributes: [
-                .font: NSFont.systemFont(ofSize: NSFont.smallSystemFontSize),
-                .link: url
-            ]))
-        }
-
-        // 版权行不在 options 里：系统关于面板是从 Info.plist 的 NSHumanReadableCopyright 读的，
-        // 这样本地化/设置界面都不用再抄一份版权文案。
-        // 图标不用传：不写 .applicationIcon 时系统自己用 App 的图标，
-        // 传 NSApp.applicationIconImage 只是把那个 implicitly unwrapped 的可选值塞进 Any，
-        // 编译器会为它报一条「coercion of implicitly unwrappable value」的警告。
-        NSApp.orderFrontStandardAboutPanel(options: [
-            .applicationName: "更新雷达",
-            .applicationVersion: short,
-            .version: build,
-            .credits: credits
-        ])
-        NSApp.activate(ignoringOtherApps: true)
-    }
-
     @objc private func quitApp() { NSApp.terminate(nil) }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
     /// 面板开着时切到别的 App（点别人的窗口、⌘Tab、点菜单栏里的系统图标）要自动收起。
-    /// NSPopover 的 .transient 在这里靠不住：它靠「popover 窗口失去 key」来收，
-    /// 而状态栏弹层（尤其 .accessory 应用）有时根本拿不到 key，于是点了别的窗口它还杵在那儿。
+    /// 自建面板没有 NSPopover 的 .transient，就靠全局点击监听 + 应用失活来收。
+    /// 点菜单栏图标时应用会先失活，这一下不能把面板收掉，否则紧接着按钮 action
+    /// 看到面板已隐藏又把它弹回来，表现就是「点图标只开不关」。
     func applicationDidResignActive(_ notification: Notification) {
+        if statusItemRect.contains(NSEvent.mouseLocation) { return }
         hidePanel()
     }
 

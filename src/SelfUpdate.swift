@@ -33,10 +33,6 @@ final class SelfUpdater: ObservableObject {
         return Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
     }
 
-    var currentBuild: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
-    }
-
     var isChecking: Bool { phase == .checking }
     var isBusy: Bool {
         switch phase {

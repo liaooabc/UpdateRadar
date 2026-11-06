@@ -428,23 +428,6 @@ final class UpdateService: ObservableObject {
                              userInfo: ["appId": updates[0].id])
     }
 
-    /// 「全部更新」：把可更新里所有能直达的更新页逐个打开，间隔 0.35 秒，
-    /// 免得浏览器同一瞬间开十几个标签把窗口顺序搅乱。
-    /// 没有直达地址（无检测源/检测失败）的行不碰。
-    func openAllUpdates() {
-        let urls = rows.compactMap { row -> URL? in
-            guard row.isUpdate, !settings.ignored.contains(row.id),
-                  let s = row.result?.downloadURL else { return nil }
-            return URL(string: s)
-        }
-        Task {
-            for (index, url) in urls.enumerated() {
-                if index > 0 { try? await Task.sleep(nanoseconds: 350_000_000) }
-                NSWorkspace.shared.open(url)
-            }
-        }
-    }
-
     /// 后台定时检测。用 NSBackgroundActivityScheduler 而不是 Timer：
     /// 它能感知睡眠、低电量、系统忙闲，唤醒时间由系统合并；
     /// 合盖一夜之后 Timer 攒下的到期事件会一次性全炸出来，它不会。
