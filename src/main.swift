@@ -40,13 +40,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 所以「点图标」不能被当成「点别处」：应用失活、全局点击两条收起路径都要放行。
     private var statusItemRect: NSRect = .zero
 
-    // 扫描时环不动，里面那支箭头往前滚（往下滑、从上面补进来，像滚轮往前滚）：
-    // 转圈会把下载箭头转成朝上的箭头，认不出是谁；往前滚既看得出"在干活"，又是原来那个箭头。
+    // 扫描时图标不动，外面荡两圈很淡的"雷达波"（往里起、往外扩、边扩边淡）。
     private var rippling = false
     private var iconLayer: CALayer?
     private var rippleLayers: [CAShapeLayer] = []
-    private static let rippleStart: CGFloat = 6.4     // 从环的内沿起
-    private static let rippleEnd: CGFloat = 11.2      // 扩到框边（22pt 的图标里环外径 8.6）
+    private static let rippleStart: CGFloat = 5.8     // 从圆环内沿起
+    private static let rippleEnd: CGFloat = 9.8       // 扩到框边（20.5pt 的图标半宽 10.25）
     private static let ripplePeriod: CFTimeInterval = 1.6
 
     private let panelSize = NSSize(width: 364, height: 548)
@@ -66,13 +65,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.imagePosition = .imageLeading
             button.target = self
             button.action = #selector(handleClick(_:))
-            button.sendAction(on: [.leftMouseUp])
+            // 左右键都发同一个 action：点一下图标就是「开/关面板」
+            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         buildMainMenu()
         buildPanel()
 
-        Notifier.shared.setup()
+        // 首次安装先看引导：通知授权放在引导里，不让系统授权框抢在欢迎窗口前面弹出来
+        if OnboardingWindow.isNeeded {
+            Notifier.shared.prepare()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
+                OnboardingWindow.presentIfNeeded()
+            }
+        } else {
+            Notifier.shared.setup()
+        }
         Notifier.shared.onOpen = { [weak self] appId in
             self?.showPanel()
             // 面板弹出来以后再让列表定位，不然 SwiftUI 还没渲染完，scrollTo 会落空
@@ -81,11 +89,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     NotificationCenter.default.post(name: .urRevealRow, object: appId)
                 }
             }
-        }
-
-        // 调试用：UPDATERADAR_RIPPLE_ALWAYS=1 一直荡波，用来单量这段动画本身的开销
-        if ProcessInfo.processInfo.environment["UPDATERADAR_RIPPLE_ALWAYS"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.startRippling() }
         }
 
         // 扫描时菜单栏图标往外荡雷达波，扫完停回原样
@@ -132,62 +135,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             completion(.finished)
         }
         selfCheckScheduler = selfCheck
-
-        applyDebugEnvironment()
-    }
-
-    /// 调试用的环境变量开关。抽出来集中放一处，`applicationDidFinishLaunching` 只负责启动顺序。
-    /// 这些开关只在从终端手动启动时生效，正常双击打开时全部为空。
-    private func applyDebugEnvironment() {
-        let env = ProcessInfo.processInfo.environment
-        if env["UPDATERADAR_FORCE_DARK"] != nil { NSApp.appearance = NSAppearance(named: .darkAqua) }
-        if env["UPDATERADAR_FORCE_LIGHT"] != nil { NSApp.appearance = NSAppearance(named: .aqua) }
-        if env["UPDATERADAR_SHOW_SETTINGS"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showSettings() }
-        }
-        // 调试用：UPDATERADAR_SETTINGS_PAGE=1 让面板直接停在设置页（截图核对排版）
-        if env["UPDATERADAR_SETTINGS_PAGE"] != nil { ui.showSettings = true }
-        // 调试用：UPDATERADAR_ABOUT_PAGE=1 让面板直接停在关于页（截图核对排版）
-        if env["UPDATERADAR_ABOUT_PAGE"] != nil { ui.showAbout = true }
-        // 调试用：UPDATERADAR_SHOW_PANEL=1 直接弹出列表页（配合 UPDATERADAR_PIN_PANEL 截图）
-        if env["UPDATERADAR_SHOW_PANEL"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.showPanel() }
-        }
-        // 调试用：UPDATERADAR_SET_BETA=0/1 起来 4 秒后按下/松开「接收测试版」开关，
-        // 用来看「切开关只重查受影响的 App」这条路径
-        if let v = env["UPDATERADAR_SET_BETA"] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 4) { [weak self] in
-                self?.service.setReceiveBeta(v == "1")
-            }
-        }
-        if env["UPDATERADAR_SHOW_ON_LAUNCH"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.showPanel() }
-            if env["UPDATERADAR_AUTOCLOSE"] != nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 8) { [weak self] in self?.hidePanel() }
-            }
-        }
-        // 调试用：不需要看屏幕，直接把面板渲染成 PNG
-        // UPDATERADAR_SNAPSHOT=/tmp/panel.png  （常配合 UPDATERADAR_TAB / UPDATERADAR_COLLAPSE）
-        if let path = env["UPDATERADAR_SNAPSHOT"] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
-                self?.writeSnapshot(to: path)
-            }
-        }
-        // 调试用：把真正弹出来的面板窗口抓一张（材质/毛玻璃只有在真窗口里才画得出来）
-        if let path = env["UPDATERADAR_SNAPSHOT_PANEL"] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
-                self?.showPanel()
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3.2) { [weak self] in
-                self?.writePanelSnapshot(to: path)
-            }
-        }
-        if env["UPDATERADAR_TEST_NOTIFY"] != nil {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 6) {
-                Notifier.shared.post(title: "更新雷达 · 通知测试",
-                                     body: "看到这条说明通知已经能用了", id: "test")
-            }
-        }
     }
 
     // MARK: - 面板
@@ -452,30 +399,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// 把面板离屏渲染成 PNG，用于截图核对界面（锁屏也照样能出图）
-    private func writeSnapshot(to path: String) {
-        let host = NSHostingView(rootView: ContentView(service: service, ui: ui, updater: updater))
-        host.frame = NSRect(origin: .zero, size: panelSize)
-        host.layoutSubtreeIfNeeded()
-        guard let rep = host.bitmapImageRepForCachingDisplay(in: host.bounds) else { return }
-        host.cacheDisplay(in: host.bounds, to: rep)
-        if let data = rep.representation(using: .png, properties: [:]) {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-        NSApp.terminate(nil)
-    }
-
-    /// 把真正弹出来的面板窗口抓成 PNG（材质只有挂在真窗口里才画得出来）
-    private func writePanelSnapshot(to path: String) {
-        guard let view = panelHost,
-              let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
-        view.cacheDisplay(in: view.bounds, to: rep)
-        if let data = rep.representation(using: .png, properties: [:]) {
-            try? data.write(to: URL(fileURLWithPath: path))
-        }
-        NSApp.terminate(nil)
-    }
-
     private func updateBadge() {
         guard let button = statusItem.button else { return }
         let n = service.updateCount
@@ -623,13 +546,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let cy = side / 2
 
             let ringInset: CGFloat = 1.1
-            // 外框是圆角方框（跟 asset 里的 SVG 一致），弧度取边长 38%
-            let frameRect = NSRect(x: ringInset, y: ringInset,
-                                   width: side - ringInset * 2,
-                                   height: side - ringInset * 2)
-            let frame = NSBezierPath(roundedRect: frameRect,
-                                     xRadius: frameRect.width * 0.38,
-                                     yRadius: frameRect.height * 0.38)
+            // 外框是正圆（跟 asset 里的 SVG 一致），扫描涟漪才是同心圆
+            let frame = NSBezierPath(ovalIn: NSRect(x: ringInset, y: ringInset,
+                                                   width: side - ringInset * 2,
+                                                   height: side - ringInset * 2))
             frame.lineWidth = 1.6
             frame.stroke()
 

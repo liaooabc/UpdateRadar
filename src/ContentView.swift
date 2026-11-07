@@ -26,8 +26,6 @@ final class ChromeState: ObservableObject {
     @Published var hoverTab: Int?
     /// 两格各自在轨道里的位置，用来让选中胶囊滑过去
     @Published var tabFrames: [Int: CGRect] = [:]
-    /// 分段轨道整条的宽度（底栏扫描胶囊按它算）
-    @Published var tabTrackWidth: CGFloat = 0
     /// 搜索框是不是正在编辑：决定要不要把「最近搜索」列出来
     @Published var searchActive = false
     /// 面板当前显示的是设置页（点齿轮翻过去，点「返回」翻回来）
@@ -57,10 +55,6 @@ final class UIState: ObservableObject {
     var tabFrames: [Int: CGRect] {
         get { chrome.tabFrames }
         set { chrome.tabFrames = newValue }
-    }
-    var tabTrackWidth: CGFloat {
-        get { chrome.tabTrackWidth }
-        set { chrome.tabTrackWidth = newValue }
     }
     var searchActive: Bool {
         get { chrome.searchActive }
@@ -129,34 +123,6 @@ final class UIState: ObservableObject {
         let wasOpen = expanded.contains(id)
         expanded = wasOpen ? expanded.subtracting([id]) : expanded.union([id])
         lastToggled = id
-    }
-
-    init() {
-        // 调试用：UPDATERADAR_TAB=1 直接打开「全部」页
-        if ProcessInfo.processInfo.environment["UPDATERADAR_TAB"] == "1" { tab = 1 }
-        // 调试用：UPDATERADAR_COLLAPSE=latest,unknown 直接收起这几组，方便看下面的组
-        if let keys = ProcessInfo.processInfo.environment["UPDATERADAR_COLLAPSE"] {
-            for k in keys.split(separator: ",") { collapsedGroups[String(k)] = true }
-        }
-        // 调试用：UPDATERADAR_EXPAND=com.apple.Keynote,... 直接展开这几行，方便截图
-        let env = ProcessInfo.processInfo.environment
-        if let ids = env["UPDATERADAR_EXPAND"] {
-            for id in ids.split(separator: ",") { expanded.insert(String(id)) }
-        }
-        // 调试用：UPDATERADAR_EXPAND_LATE=... 起来五秒后展开，用来看展开时的自动滚动
-        if let ids = env["UPDATERADAR_EXPAND_LATE"], let id = ids.split(separator: ",").first {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
-                self?.toggleExpanded(String(id))
-            }
-        }
-    }
-}
-
-/// 每一行在列表里的位置，用来判断「展开后会不会超出面板底部」
-struct RowFrameKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue()) { _, new in new }
     }
 }
 
@@ -546,12 +512,6 @@ struct ContentView: View {
             .coordinateSpace(name: "tabTrack")
             .background(alignment: .topLeading) { tabPreview }
             .onPreferenceChange(TabFrameKey.self) { ui.tabFrames = $0 }
-            .background {
-                GeometryReader { geo in
-                    Color.clear.preference(key: TrackWidthKey.self, value: geo.size.width)
-                }
-            }
-            .onPreferenceChange(TrackWidthKey.self) { ui.tabTrackWidth = $0 }
             .modifier(GlassTrack())
 
             Spacer(minLength: 0)
@@ -593,8 +553,8 @@ struct ContentView: View {
                     .offset(y: Self.barControlHeight + 18)
             }
         }
-        // 只让这一条的胶囊和搜索框做过渡，列表不参与
-        .animation(.easeInOut(duration: 0.18), value: ui.tab)
+        // 动画只挂在 tabPreview 上（见那里）：之前挂在整条 HStack 上，
+        // 切页签时连轨道那圈液态玻璃也跟着逐帧重绘，胶囊滑动就掉帧。
         // 换页签时键盘选中的行作废，免得按 ↓ 从上一个页签的位置开始数。
         // 注意要先判空再写：@Published 不管值变没变都会发通知，
         // 无脑赋值会让两页上百行跟着重新求值（切页签那 100ms 有一半是这里来的）
@@ -669,6 +629,8 @@ struct ContentView: View {
             }
             .padding(.horizontal, 10)
             .frame(height: Self.barControlHeight - 6)   // 轨道上下各留 3pt
+            // 文字深浅跟着胶囊一起过渡（0.18s 和胶囊同拍），整条轨道不再做隐式动画
+            .animation(.easeInOut(duration: 0.18), value: selected)
             .background {
                 // 只量位置，不画背景：胶囊统一由 tabPreview 画，才能在两格之间滑动
                 GeometryReader { proxy in
@@ -691,19 +653,16 @@ struct ContentView: View {
     private var tabPreview: some View {
         ZStack(alignment: .topLeading) {
             if let f = ui.tabFrames[ui.tab] {
-                Capsule()
+                PillRect(rect: f)
                     .fill(Color.primary.opacity(0.13))
-                    .frame(width: f.width, height: f.height)
-                    .offset(x: f.minX, y: f.minY)
             }
             if let h = ui.hoverTab, h != ui.tab, let f = ui.tabFrames[h] {
-                Capsule()
+                PillRect(rect: f)
                     .fill(Color.primary.opacity(0.05))
-                    .frame(width: f.width, height: f.height)
-                    .offset(x: f.minX, y: f.minY)
                     .transition(.opacity)
             }
         }
+        .animation(.easeInOut(duration: 0.18), value: ui.tab)
         .animation(.easeInOut(duration: 0.14), value: ui.hoverTab)
         .allowsHitTesting(false)
     }
@@ -772,7 +731,8 @@ struct ContentView: View {
                     if service.checking {
                         NativeSpinner().frame(width: 12, height: 12)
                     } else {
-                        Image(systemName: "arrow.triangle.2.circlepath")
+                        // 空闲用虚线圆环：跟图标同一套「环」语言，一眼能认出是扫描
+                        Image(systemName: "circle.dashed")
                             .font(.system(size: 11, weight: .medium))
                     }
                     Text(service.checking ? "扫描中" : "扫描")
@@ -843,6 +803,42 @@ private struct ListPage: View {
     private var rows: [AppRow] { computeVisibleRows(service, ui) }
     private var groups: [RowGroup] { computeRowGroups(service, ui) }
 
+    // MARK: - 行右键菜单
+
+    /// 右键落在哪一行：菜单跟着鼠标走，而鼠标一定停在被右键的那一行上，
+    /// 所以直接用悬停状态反查，不用再做坐标换算
+    private func hoveredRow() -> AppRow? {
+        let visible = index == 0 ? rows : groups.flatMap(\.rows)
+        return visible.first { ui.hovers.box(for: $0.id).on }
+    }
+
+    /// 菜单内容跟原来 SwiftUI 里的 .contextMenu 一致
+    private func rowMenu(_ row: AppRow, _ handler: MenuHandler) -> NSMenu {
+        handler.reset()
+        let menu = NSMenu()
+        func add(_ title: String, _ run: @escaping () -> Void) {
+            menu.addItem(handler.item(title, run))
+        }
+        if row.result?.downloadURL != nil {
+            add("打开下载页") { service.openUpdate(for: row) }
+        }
+        add("打开这个 App") { service.launch(row.app) }
+        add("在 Finder 中显示") { service.reveal(row.app) }
+        menu.addItem(.separator())
+        if row.isUpdate {
+            add("这个已经是最新") { service.dismiss(row) }
+        }
+        if service.isDismissed(row.id) {
+            add("恢复提醒") { service.undismiss(row.id) }
+        }
+        if service.settings.ignored.contains(row.id) {
+            add("恢复提醒") { service.unignore(row.id) }
+        } else {
+            add("忽略它") { service.ignore(row.app) }
+        }
+        return menu
+    }
+
     var body: some View {
         GeometryReader { geo in
             let viewHeight = geo.size.height
@@ -875,20 +871,19 @@ private struct ListPage: View {
             .listStyle(.plain)
             .scrollContentBackground(.hidden)
             .environment(\.defaultMinListRowHeight, 1)
+            // 行的右键菜单：自己用 AppKit 弹 NSMenu（见 RowMenuMonitor），
+            // 这样系统不会给被右键的行再画一层直角高亮
+            .background(RowMenuMonitor(active: { index == ui.tab },
+                                       hoveredRow: { hoveredRow() },
+                                       buildMenu: { rowMenu($0, $1) }))
             .defaultScrollAnchor(.top)
             .onChange(of: rows.count) {
                 // 正在读某一行展开的说明时，别因为后台查完了就把列表甩回顶部
                 if index == 0, ui.expanded.isEmpty { scrollTop(proxy) }
             }
-            // 两份列表都在上报位置，所以用「页签|行 id」拼 key，分开存
-            .onPreferenceChange(RowFrameKey.self) {
-                var frames: [String: CGRect] = [:]
-                let prefix = "\(index)|"
-                for (key, rect) in $0 where key.hasPrefix(prefix) {
-                    frames[String(key.dropFirst(prefix.count))] = rect
-                }
-                ui.rowFramesByTab[index] = frames
-            }
+            // 行的位置只有「展开说明时要滚一下」才用得上，由展开的那一行自己上报（见 RowView），
+            // 收起的行不上报——之前每行都挂 GeometryReader + PreferenceKey，
+            // 滚动时每帧都要把上百行的 CGRect 重新合并一遍，这就是上下滚卡顿的来源。
             // 键盘选中的行滚进视野中间；只由当前显示的这份列表来做
             .onChange(of: ui.keyRow) {
                 guard index == ui.tab, let id = ui.keyRow else { return }
@@ -943,7 +938,9 @@ private struct ListPage: View {
                         // keyRow 只留给键盘 ↑↓ 记住当前行，不再画任何底色
                         ui.keyRow = row.id
                         withAnimation(.easeInOut(duration: 0.16)) { ui.toggleExpanded(row.id) }
-                    })
+                    },
+                    // 展开的行自己上报位置；收起的行不上报（滚动时零开销）
+                    onFrame: { ui.rowFramesByTab[tabIndex, default: [:]][row.id] = $0 })
             .listRowInsets(EdgeInsets())
             .listRowBackground(Color.clear)
             .listRowSeparator(.hidden)
@@ -952,14 +949,6 @@ private struct ListPage: View {
             // 这里补差：6 + 8 = 14，5 + 9 = 14。系统滑动时的裁剪边界也落在色块边上。
             .padding(.leading, 6)
             .padding(.trailing, 5)
-            .background {
-                // 两份列表都会上报行位置，key 里带页签号，避免同名行互相覆盖；
-                // 注意这里不能读 ui.tab，否则切页签会让上百行全部重新求值
-                GeometryReader { g in
-                    Color.clear.preference(key: RowFrameKey.self,
-                                           value: ["\(tabIndex)|\(row.id)": g.frame(in: .named("urList"))])
-                }
-            }
             .id(row.id)
             // 滑动操作用系统的 swipeActions：跟手位移、越界回弹、松手动画都是 SwiftUI 自己做的。
             // 按钮里只放文字：用 Label 的话系统会把图标塞进胶囊、标题甩到胶囊外面，
@@ -1171,35 +1160,24 @@ private struct TabFrameKey: PreferenceKey {
     }
 }
 
-/// 轨道整条的宽度（底栏扫描胶囊按它的一半算）
-private struct TrackWidthKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
-        value = max(value, nextValue())
-    }
-}
+/// 选中胶囊：位置和宽度直接作为 Shape 的 animatableData 插值。
+/// 之前是 Capsule().frame().offset()——改宽高等于改布局，胶囊滑动的每一帧
+/// 都要重新走一遍布局，压在液态玻璃上就掉帧。改成路径插值后只重画这一个形状。
+private struct PillRect: Shape {
+    var rect: CGRect
 
-/// 圆形玻璃图标（扫描 / 设置齿轮共用）：同一个 28pt 圆、同一套玻璃材质。
-/// 玻璃必须画在 label **里面**——Menu 的 borderlessButton 会自己接管外层背景，
-/// 加在 Menu 外面的 glassEffect 完全不会出现（齿轮之前就是一坨平面图标的原因）。
-private struct GlassIcon: View {
-    let systemName: String
-    /// 扫描中：换成系统自带的转圈进度指示器
-    var spinning: Bool = false
-
-    var body: some View {
-        Group {
-            if spinning {
-                NativeSpinner()
-                    .allowsHitTesting(false)
-            } else {
-                Image(systemName: systemName)
-                    .font(.callout.weight(.medium))
-            }
+    var animatableData: AnimatablePair<AnimatablePair<CGFloat, CGFloat>,
+                                       AnimatablePair<CGFloat, CGFloat>> {
+        get { .init(.init(rect.minX, rect.minY), .init(rect.width, rect.height)) }
+        set {
+            rect = CGRect(x: newValue.first.first, y: newValue.first.second,
+                          width: newValue.second.first, height: newValue.second.second)
         }
-        .frame(width: 26, height: 26)
-        .contentShape(Circle())
-        .modifier(GlassCircle())
+    }
+
+    func path(in bounds: CGRect) -> Path {
+        Path(roundedRect: rect.offsetBy(dx: bounds.minX, dy: bounds.minY),
+             cornerRadius: rect.height / 2, style: .continuous)
     }
 }
 
@@ -1218,24 +1196,10 @@ private struct NativeSpinner: NSViewRepresentable {
         return indicator
     }
 
-    func updateNSView(_ indicator: NSProgressIndicator, context: Context) {
-        indicator.startAnimation(nil)
-    }
+    func updateNSView(_ indicator: NSProgressIndicator, context: Context) {}
 }
 
 /// 圆形玻璃按钮（刷新 / 设置齿轮用）：跟分段控件、搜索框同一套材质
-private struct GlassCircle: ViewModifier {
-    func body(content: Content) -> some View {
-        if #available(macOS 26.0, *) {
-            content.glassEffect(.regular.interactive(), in: .circle)
-        } else {
-            content
-                .background(Circle().fill(Color.primary.opacity(0.06)))
-                .overlay(Circle().strokeBorder(Color.primary.opacity(0.08), lineWidth: 0.8))
-        }
-    }
-}
-
 /// 圆形按钮（底栏关于 / 设置 / 退出）：用系统的玻璃按钮样式，悬停明暗由系统给
 private struct GlassCircleButton: ViewModifier {
     func body(content: Content) -> some View {
@@ -1472,6 +1436,8 @@ struct RowView: View {
     /// 行底要不要画分隔线（最后一行不画）
     var showsDivider: Bool = false
     var onToggle: () -> Void = {}
+    /// 展开时把自己在列表里的位置报给列表（列表用它判断要不要滚一下）
+    var onFrame: (CGRect) -> Void = { _ in }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 5) {
@@ -1537,6 +1503,18 @@ struct RowView: View {
         // 「更新」按钮离右边 23pt，看着就是歪的。外层的 8pt 已经够让滚动条错开了。
         .padding(.horizontal, 4)
         .padding(.vertical, 8)
+        // 只有展开的行量自己位置：这一件事只在点开说明时用得上，
+        // 收起的行完全不参与几何上报，滚动时不会再有几十上百行的几何计算。
+        .background {
+            if expanded {
+                GeometryReader { g in
+                    Color.clear
+                        .onChange(of: g.frame(in: .named("urList")), initial: true) { _, rect in
+                            onFrame(rect)
+                        }
+                }
+            }
+        }
         // 悬停态交给系统（NSVisualEffectView .selection），展开态仍用强调色的淡底。
         .background {
             if hover.on {
@@ -1565,26 +1543,9 @@ struct RowView: View {
             }
         }
         .contentShape(Rectangle())
-        .contextMenu {
-            // 顺序：打开下载页 → 打开这个 App → 在 Finder 中显示
-            if row.result?.downloadURL != nil {
-                Button("打开下载页") { service.openUpdate(for: row) }
-            }
-            Button("打开这个 App") { service.launch(row.app) }
-            Button("在 Finder 中显示") { service.reveal(row.app) }
-            Divider()
-            if row.isUpdate {
-                Button("这个已经是最新") { service.dismiss(row) }
-            }
-            if service.isDismissed(row.id) {
-                Button("恢复提醒") { service.undismiss(row.id) }
-            }
-            if ignored {
-                Button("恢复提醒") { service.unignore(row.id) }
-            } else {
-                Button("忽略它") { service.ignore(row.app) }
-            }
-        }
+        // 右键菜单不在这里挂：SwiftUI 的 .contextMenu 挂在 List 行上时，系统会给那一行
+        // 画一层通栏直角的高亮，和我们 12pt 圆角的行底叠在一起就多出一个方框。
+        // 菜单改由 RowMenuMonitor 用 AppKit 弹（见文件下方的实现）。
     }
 
     // MARK: - 展开后的更新说明
@@ -1802,6 +1763,94 @@ private struct RowDivider: View {
             .fill(Color.primary.opacity(0.08))
             .frame(height: 0.5)
             .padding(.leading, 29)
+    }
+}
+
+// MARK: - 行右键菜单（AppKit）
+
+/// 右键菜单的每个条目存一个闭包。NSMenuItem 的 target 是弱引用，
+/// 得有个对象在菜单弹出期间活着，闭包才不会丢。
+final class MenuHandler: NSObject {
+    private var actions: [() -> Void] = []
+
+    func reset() { actions.removeAll() }
+
+    func item(_ title: String, _ action: @escaping () -> Void) -> NSMenuItem {
+        actions.append(action)
+        let item = NSMenuItem(title: title, action: #selector(fire(_:)), keyEquivalent: "")
+        item.target = self
+        item.tag = actions.count - 1
+        return item
+    }
+
+    @objc private func fire(_ sender: NSMenuItem) {
+        guard actions.indices.contains(sender.tag) else { return }
+        actions[sender.tag]()
+    }
+}
+
+/// 自己接右键、自己弹 NSMenu。
+/// 不用 SwiftUI 的 .contextMenu，是因为它挂在 List 行上时，系统会给那一行再画一层
+/// 通栏直角的高亮块，和行底的 12pt 圆角叠在一起就多出一个方框。
+private struct RowMenuMonitor: NSViewRepresentable {
+    let active: () -> Bool
+    let hoveredRow: () -> AppRow?
+    let buildMenu: (AppRow, MenuHandler) -> NSMenu
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        context.coordinator.install(view: view, active: active,
+                                    hoveredRow: hoveredRow, buildMenu: buildMenu)
+        return view
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        context.coordinator.update(view: nsView, active: active,
+                                   hoveredRow: hoveredRow, buildMenu: buildMenu)
+    }
+
+    final class Coordinator {
+        private weak var host: NSView?
+        private var active: () -> Bool = { false }
+        private var hoveredRow: () -> AppRow? = { nil }
+        private var buildMenu: (AppRow, MenuHandler) -> NSMenu = { _, _ in NSMenu() }
+        private let handler = MenuHandler()
+        private var monitor: Any?
+
+        func install(view: NSView, active: @escaping () -> Bool,
+                     hoveredRow: @escaping () -> AppRow?,
+                     buildMenu: @escaping (AppRow, MenuHandler) -> NSMenu) {
+            update(view: view, active: active, hoveredRow: hoveredRow, buildMenu: buildMenu)
+            guard monitor == nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .rightMouseDown) { [weak self] event in
+                guard let self,
+                      self.active(),
+                      event.window?.isVisible == true,
+                      let host = self.host,
+                      let row = self.hoveredRow()
+                else { return event }
+                let menu = self.buildMenu(row, self.handler)
+                menu.popUp(positioning: nil,
+                           at: host.convert(event.locationInWindow, from: nil),
+                           in: host)
+                return nil
+            }
+        }
+
+        func update(view: NSView, active: @escaping () -> Bool,
+                    hoveredRow: @escaping () -> AppRow?,
+                    buildMenu: @escaping (AppRow, MenuHandler) -> NSMenu) {
+            host = view
+            self.active = active
+            self.hoveredRow = hoveredRow
+            self.buildMenu = buildMenu
+        }
+
+        deinit {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+        }
     }
 }
 

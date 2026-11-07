@@ -28,9 +28,7 @@ final class SelfUpdater: ObservableObject {
     private var pendingDigest: String?
 
     var currentVersion: String {
-        // 调试用：UPDATERADAR_FAKE_VERSION=1.0.9 假装本机是旧版，看「有新版本」那一行长什么样
-        if let fake = ProcessInfo.processInfo.environment["UPDATERADAR_FAKE_VERSION"] { return fake }
-        return Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
+        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0.0"
     }
 
     var isChecking: Bool { phase == .checking }
@@ -44,7 +42,6 @@ final class SelfUpdater: ObservableObject {
     /// 启动时、以及每 24 小时一次：距上次检查不到一天就不打扰
     func checkIfStale() {
         if let last = lastChecked, Date().timeIntervalSince(last) < 24 * 3600 {
-            // 调试用：UPDATERADAR_AUTO_INSTALL=1 查到新版本就自己走一遍下载+安装（验证整条链路）
             maybeAutoInstall()
             return
         }
@@ -78,7 +75,6 @@ final class SelfUpdater: ObservableObject {
                                             downloadURL: (dmg?["browser_download_url"] as? String) ?? page,
                                             pageURL: page,
                                             hasDMG: dmg != nil)
-                    Debug.autoInstallIfRequested(self)
                 } else {
                     self.pendingDigest = nil
                     self.phase = .upToDate(latest)
@@ -90,15 +86,6 @@ final class SelfUpdater: ObservableObject {
     private func maybeAutoInstall() {
         if case let .available(version, url, _, hasDMG) = phase, hasDMG {
             install(version: version, downloadURL: url, digest: pendingDigest)
-        }
-    }
-
-    private enum Debug {
-        static func autoInstallIfRequested(_ updater: SelfUpdater) {
-            guard ProcessInfo.processInfo.environment["UPDATERADAR_AUTO_INSTALL"] != nil else { return }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak updater] in
-                updater?.maybeAutoInstall()
-            }
         }
     }
 

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- 前景层 2（深色）：白色版，与扫描盘同色。尾部色阶为"越靠尾端越深" -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="512" y1="386" x2="512" y2="578" stroke="#85868B" stroke-width="78"/>
+    <line x1="512" y1="425" x2="512" y2="578" stroke="#B6B7BC" stroke-width="78"/>
+    <line x1="512" y1="464" x2="512" y2="578" stroke="#FFFFFF" stroke-width="78"/>
+    <polyline points="420,564 512,664 604,564" stroke="#FFFFFF" stroke-width="78"/>
+  </g>
+</svg>

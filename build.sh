@@ -37,9 +37,11 @@ DEVELOPER_DIR="$CLT_DEV" swiftc -O -whole-module-optimization \
     "$SRC"/*.swift
 
 echo "▸ 图标（Icon Composer 图层包：圆环 + 箭头，白天白底黑图 / 暗夜黑底白图）"
-ICON_DOC="$ROOT/Resources/AppIcon.icon"      # 设计源文件（4 个 SVG + icon.json，可用 Icon Composer 打开改）
-ICON_PKG="$BUILD/AppIcon.icon"               # actool 只认这个位置，换路径会静默不产出
-                                             # 图标只有一条路：Resources/AppIcon.icon → actool → Assets.car。
+ICON_DOC="$ROOT/Resources/AppIcon37.icon"     # 设计源文件（6 个 SVG + icon.json，可用 Icon Composer 打开改）
+                                            # 名字带 26 是故意的：换图标名可以让系统的图标缓存重新取图，
+                                            # 不然 Finder/Dock 会一直显示旧图标（系统缓存目录属 root，删不掉）
+ICON_PKG="$BUILD/AppIcon37.icon"             # actool 只认这个位置，换路径会静默不产出
+                                             # 图标只有一条路：Resources/AppIcon37.icon → actool → Assets.car。
 # 老的单套 .icns 兜底（tools/make_icon.swift 现画蓝色箭头）已经删掉 —— 那是上一版的设计，
 # 留着它只会在 actool 失败时把旧图标塞进包里，反而更难查。
 if [ -f "$ICON_DOC/icon.json" ]; then
@@ -56,7 +58,7 @@ if [ -f "$ICON_DOC/icon.json" ]; then
     MENUBAR_CATALOG="$ROOT/Resources/Assets.xcassets"
     if DEVELOPER_DIR="$XCODE_DEV" xcrun actool --compile "$ACTOOL_OUT" \
          --platform macosx --minimum-deployment-target 26.0 \
-         --app-icon AppIcon --output-partial-info-plist "$BUILD/icon-partial.plist" \
+         --app-icon AppIcon37 --output-partial-info-plist "$BUILD/icon-partial.plist" \
          "$ICON_PKG" "$MENUBAR_CATALOG" >/dev/null 2>"$BUILD/actool.log"; then
         # 只装 Assets.car：它带 Aqua / DarkAqua / Tinted 三套，Finder、启动台（Apps.app）、
         # 显示简介、快速查看都读同一份，换外观不会"跳出另一个图标"。

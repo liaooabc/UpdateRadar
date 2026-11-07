@@ -4,8 +4,8 @@
     {
       "layers": [
         {
-          "image-name": "01-glyph-day.svg",
-          "name": "1_Glyph_Day",
+          "image-name": "20-arrow-day.svg",
+          "name": "2_Arrow_Day",
           "opacity-specializations": [
             {
               "appearance": "dark",
@@ -18,8 +18,36 @@
           ]
         },
         {
-          "image-name": "01-glyph-night.svg",
-          "name": "1_Glyph_Night",
+          "image-name": "20-arrow-night.svg",
+          "name": "2_Arrow_Night",
+          "opacity-specializations": [
+            {
+              "appearance": "light",
+              "value": 0.0
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "layers": [
+        {
+          "image-name": "10-ring-day.svg",
+          "name": "1_Ring_Day",
+          "opacity-specializations": [
+            {
+              "appearance": "dark",
+              "value": 0.0
+            },
+            {
+              "appearance": "tinted",
+              "value": 0.0
+            }
+          ]
+        },
+        {
+          "image-name": "10-ring-night.svg",
+          "name": "1_Ring_Night",
           "opacity-specializations": [
             {
               "appearance": "light",

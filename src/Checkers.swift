@@ -962,6 +962,18 @@ enum Rules {
         return verdict(app, latest: latest, url: downloadPage, allowBeta: allowBeta)
     }
 
+    /// 官网页面挂的可能是老包，最新包在其背后的安装包接口里（酷家乐就是这种）。
+    /// 接口 JSON 形如：
+    /// {"c":"0","m":"","d":{"url":"…/Kujiale-12.4.4-stable-zhannei_denglu.dmg","version":"12.4.4",…}}
+    static func installerAPI(app: InstalledApp, endpoint: String,
+                             downloadPage: String, allowBeta: Bool) async -> Checker.Outcome? {
+        guard let obj = await Net.json(endpoint) as? [String: Any],
+              let d = obj["d"] as? [String: Any],
+              let version = d["version"] as? String, !version.isEmpty
+        else { return nil }
+        return verdict(app, latest: version, url: downloadPage, allowBeta: allowBeta)
+    }
+
     /// GitHub Releases 最新 tag
     static func githubRepo(app: InstalledApp, repo: String, downloadPage: String,
                            allowBeta: Bool) async -> Checker.Outcome? {
@@ -1048,14 +1060,14 @@ enum Rules {
                                   downloadPage: "https://www.coze.cn/",
                                   name: "扣子")
         },
-        // 酷家乐：官网下载页里直接挂着 dmg（Kujiale-12.3.13-stable.dmg），版本号在文件名里。
-        // 注意这个页面更新很慢（2026-10 还挂着 2023-11 的 12.3.13），所以本机更高是正常的。
+        // 酷家乐：官网下载页（activity/136）里的包是死的（页面上仍挂着 2023-11 的 12.3.13），
+        // 最新包由页面背后的安装包接口返回，用它的 d.version 才算官方当前版本。
         VendorRule(matches: { $0.bundleId == "com.kujiale.mac.kujiale" }) { app, _, allowBeta in
-            await pageRegex(app: app,
-                            page: "https://www.kujiale.com/activity/136",
-                            pattern: #"Kujiale-([0-9]+\.[0-9]+\.[0-9]+)-stable\.dmg"#,
-                            downloadPage: "https://www.kujiale.com/activity/136",
-                            allowBeta: allowBeta)
+            await installerAPI(app: app,
+                               endpoint: "https://www.kujiale.com/desktop-publish/api/installer"
+                                   + "?channel=zhannei_denglu&desktopKey=kujiale&target=mac&arch=all",
+                               downloadPage: "https://www.kujiale.com/activity/136",
+                               allowBeta: allowBeta)
         },
         // 微信
         VendorRule(matches: { $0.bundleId == "com.tencent.xinWeChat" }) { app, _, allowBeta in

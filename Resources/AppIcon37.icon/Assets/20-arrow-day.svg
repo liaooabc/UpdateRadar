@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- 前景层 2：更新箭头（实心笔画，边缘清晰）。放在扫描盘中央，是唯一"动作" -->
+  <!-- 黑色版：与扫描盘同色，整体单色。尾部三段叠放的色阶改为"越靠尾端越浅" -->
+  <g fill="none" stroke-linecap="round" stroke-linejoin="round">
+    <line x1="512" y1="386" x2="512" y2="578" stroke="#7E7F84" stroke-width="78"/>
+    <line x1="512" y1="425" x2="512" y2="578" stroke="#4A4B50" stroke-width="78"/>
+    <line x1="512" y1="464" x2="512" y2="578" stroke="#1B1C1F" stroke-width="78"/>
+    <polyline points="420,564 512,664 604,564" stroke="#1B1C1F" stroke-width="78"/>
+  </g>
+</svg>

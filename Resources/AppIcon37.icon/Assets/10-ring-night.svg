@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- 前景层 1（深色）：半圆头开口环 + 三个同宽的点，白色，缺口 84° -->
+  <!-- 三个点的颜色对应箭头尾部的色阶：中间点 = 尾端最外（深）层，两侧点 = 中间层 -->
+  <g>
+    <circle cx="512" cy="512" r="292.5" fill="none" stroke="#FFFFFF" stroke-width="70"
+            stroke-linecap="round" stroke-dasharray="1409.0 428.83"
+            transform="rotate(-48 512 512)"/>
+    <circle cx="407.2" cy="238.8" r="35" fill="#B6B7BC"/>
+    <circle cx="512" cy="219.5" r="35" fill="#85868B"/>
+    <circle cx="616.8" cy="238.8" r="35" fill="#B6B7BC"/>
+  </g>
+</svg>

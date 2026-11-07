@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import Foundation
+import Network
 
 @MainActor
 final class UpdateService: ObservableObject {
@@ -15,6 +16,11 @@ final class UpdateService: ObservableObject {
     private var apps: [InstalledApp] = []
     private var results: [String: CheckResult] = [:]
     private var scheduler: NSBackgroundActivityScheduler?
+    /// 网络从不可用恢复到可用时补查一轮（开机时 Wi‑Fi 往往还没连上）
+    private let pathMonitor = NWPathMonitor()
+    private let pathGate = PathGate()
+    /// 合盖唤醒后补查一轮
+    private var wakeObserver: NSObjectProtocol?
     private var didBootstrap = false
     /// 扫描正在进行（防止连点「扫描」叠起来跑）
     private var scanning = false
@@ -42,6 +48,7 @@ final class UpdateService: ObservableObject {
         startWatchingApplications()
         rescan(thenCheck: true)
         scheduleAutoCheck()
+        startEnvironmentTriggers()
     }
 
     /// 扫描放到后台队列：遍历 /Applications、逐个读 Info.plist 是磁盘密集操作，
@@ -446,6 +453,28 @@ final class UpdateService: ObservableObject {
         scheduler = s
     }
 
+    // MARK: - 环境触发
+
+    /// 网络恢复、合盖唤醒后各补查一轮。checkAll 会自己跳过还新鲜的，
+    /// 只补超期或上一轮失败的那些，不会把 136 个 App 全跑一遍。
+    private func startEnvironmentTriggers() {
+        pathMonitor.pathUpdateHandler = { [weak self, pathGate] path in
+            guard pathGate.movedToOnline(path.status == .satisfied) else { return }
+            Task { @MainActor in self?.checkAll() }
+        }
+        pathMonitor.start(queue: DispatchQueue(label: "com.hushixiong.updateradar.network"))
+
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            // 刚唤醒时 Wi‑Fi 还在重连，等 3 秒再查，否则第一轮又全是超时
+            Task { @MainActor in
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                self?.checkAll()
+            }
+        }
+    }
+
     // MARK: - 持久化
 
     private struct Disk: Codable {
@@ -498,6 +527,24 @@ final class UpdateService: ObservableObject {
 
     func launch(_ app: InstalledApp) {
         NSWorkspace.shared.open(URL(fileURLWithPath: app.path))
+    }
+}
+
+/// 只认「离线 → 在线」这一次翻越。刚启动时系统也会报一次 online，
+/// 那时启动扫描已经在跑了，不必再补一轮。
+private final class PathGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var seenFirst = false
+    private var lastOnline = false
+
+    func movedToOnline(_ online: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        let first = !seenFirst
+        seenFirst = true
+        let was = lastOnline
+        lastOnline = online
+        return !first && online && !was
     }
 }
 

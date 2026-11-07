@@ -16,12 +16,21 @@ final class Notifier: NSObject, ObservableObject, UNUserNotificationCenterDelega
     @Published private(set) var authorization: UNAuthorizationStatus = .notDetermined
 
     func setup() {
-        let center = UNUserNotificationCenter.current()
-        center.delegate = self
+        prepare()
+        requestPermission()
+    }
+
+    /// 只挂代理、读当前授权状态，不弹系统授权框（首次引导要自己决定什么时候问）
+    func prepare() {
+        UNUserNotificationCenter.current().delegate = self
         refreshAuthorization()
+    }
+
+    /// 请求通知授权；系统只会弹一次，之后按真实状态走
+    func requestPermission() {
         guard !asked else { return }
         asked = true
-        center.requestAuthorization(options: [.alert, .sound]) { ok, _ in
+        UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { ok, _ in
             Task { @MainActor in
                 Notifier.shared.granted = ok
                 Notifier.shared.refreshAuthorization()
