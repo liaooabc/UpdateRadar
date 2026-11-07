@@ -44,8 +44,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var rippling = false
     private var iconLayer: CALayer?
     private var rippleLayers: [CAShapeLayer] = []
-    private static let rippleStart: CGFloat = 5.8     // 从圆环内沿起
-    private static let rippleEnd: CGFloat = 9.8       // 扩到框边（20.5pt 的图标半宽 10.25）
+    private static let rippleStartRatio: CGFloat = 0.566  // 从圆环内沿起（占图标半宽的比）
+    private static let rippleEndRatio: CGFloat = 0.956    // 扩到框边
     private static let ripplePeriod: CFTimeInterval = 1.6
 
     private let panelSize = NSSize(width: 364, height: 548)
@@ -480,20 +480,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         // 涟漪：两条弧线同时往外扩、边扩边淡，错开半个周期，看着是连续往外推
         let center = CGPoint(x: rect.width / 2, y: rect.height / 2)
+        // 涟漪按图标半宽取比例，改图标尺寸时不用再手调这两个半径
+        let half = min(rect.width, rect.height) / 2
+        let rippleStart = half * Self.rippleStartRatio
+        let rippleEnd = half * Self.rippleEndRatio
         for i in 0..<2 {
             let wave = CAShapeLayer()
             wave.frame = rect
             wave.fillColor = nil
             wave.strokeColor = color.withAlphaComponent(0.7).cgColor
             wave.lineWidth = 1.3
-            wave.path = circlePath(center: center, radius: Self.rippleStart)
+            wave.path = circlePath(center: center, radius: rippleStart)
             wave.opacity = 0
             button.layer?.addSublayer(wave)
             rippleLayers.append(wave)
 
             let grow = CABasicAnimation(keyPath: "path")
-            grow.fromValue = circlePath(center: center, radius: Self.rippleStart)
-            grow.toValue = circlePath(center: center, radius: Self.rippleEnd)
+            grow.fromValue = circlePath(center: center, radius: rippleStart)
+            grow.toValue = circlePath(center: center, radius: rippleEnd)
 
             let fade = CAKeyframeAnimation(keyPath: "opacity")
             fade.values = [0, 1, 1, 0]
@@ -528,9 +532,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // 优先用 asset catalog 里的模板图（Resources/Assets.xcassets/UpdateRadarMenuBar.svg）：
         // 矢量、任意缩放都清晰，设计师能直接改。template 渲染，系统按菜单栏明暗自动反色。
         //
-        // 尺寸：SVG 的外框是 22，方框只占 15.2+描边/22。按 20.5pt 画出来方框是 16pt，
-        // 跟 Wi‑Fi、电池这类系统图标并排时高度一致；按 22pt 画会高出一头。
-        let assetSide: CGFloat = 20.5
+        // 尺寸：SVG 的外框是 22，环只占 19.6/22。按 23pt 画出来环外沿约 20.5pt，
+        // 比 20.5pt 时（外沿 18.3pt）明显大一圈，仍不超过菜单栏高度。
+        let assetSide: CGFloat = 23
         if let asset = NSImage(named: "UpdateRadarMenuBar")?.copy() as? NSImage {
             asset.size = NSSize(width: assetSide, height: assetSide)
             asset.isTemplate = true
