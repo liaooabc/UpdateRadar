@@ -704,9 +704,11 @@ enum Checker {
     private static func pickBestAppStoreOutcome(_ outcomes: [Outcome]) -> Outcome? {
         guard !outcomes.isEmpty else { return nil }
         if outcomes.count == 1 { return outcomes[0] }
-        // 两个都有版本号 → 取更新的
+        // 两个都有版本号 → 取更新的；只有一个有版本号 → 取有的那个
+        //（另一个可能是 iOS 主记录被判成「核对不了」，latest 为空）
         var best = outcomes[0]
         for o in outcomes.dropFirst() {
+            if best.latest == nil, o.latest != nil { best = o; continue }
             if let bv = best.latest, let ov = o.latest, Ver.isNewer(ov, than: bv) {
                 best = o
             }
@@ -874,6 +876,16 @@ enum Checker {
         // 比商店产品页更像「软件网站」
         let seller = (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString }
         let release = parseISO8601(first["currentVersionReleaseDate"] as? String)
+
+        // kind=software 说明这条记录是 iOS 主记录（APTV 这种全平台通用 App）：
+        // version/更新说明都是 iPhone 版的，接口根本不提供 Mac 版的版本号
+        //（Mac App Store 应用里显示的才是 Mac 版，二者经常差一个小版本）。
+        // 它要是说「比本机新」，不能当 Mac 版更新的证据——宁可说「核对不了」，别误报。
+        let isIOSPrimaryRecord = (first["kind"] as? String) != "mac-software"
+        if isIOSPrimaryRecord, Ver.isNewer(latest, than: current) {
+            return Outcome(status: .unknown, latest: nil, url: page, homepage: seller,
+                           note: "商店接口只提供它 iOS 版的版本号（\(latest)），Mac 版请对照 App Store 应用内的页面")
+        }
 
         // 商店接口偶尔也会给构建号（开发者把 build 填进 version 字段）
         if latestIsInstalledBuild(latest, current: current, build: build) {
