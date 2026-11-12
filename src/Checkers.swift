@@ -665,10 +665,10 @@ enum Checker {
         // 1. 商店：cn 和 us 并行查，**取两个里版本号更高的**。
         //    iTunes lookup 每个区走自己的 CDN 节点，发版后不同区刷新时间差可能超过 1 小时；
         //    之前串行查 cn 有结果就不查 us，经常正好撞上 cn 还缓存着旧数据、us 已经刷了的情况。
-        async let cnOutcome = appStore(bundleId: bid, current: app.version, build: app.build,
+        async let cnOutcome = appStore(bundleId: bid, name: app.name, current: app.version, build: app.build,
                                        installedAt: app.installedAt, country: "cn",
                                        allowBeta: allowBeta)
-        async let usOutcome = appStore(bundleId: bid, current: app.version, build: app.build,
+        async let usOutcome = appStore(bundleId: bid, name: app.name, current: app.version, build: app.build,
                                        installedAt: app.installedAt, country: "us",
                                        allowBeta: allowBeta)
         let outcomes = [await cnOutcome, await usOutcome].compactMap { $0 }
@@ -860,7 +860,7 @@ enum Checker {
         return .failure(sawAnyVersioned ? .incompatibleSystem : .noItems)
     }
 
-    static func appStore(bundleId: String, current: String, build: String?, installedAt: Date?,
+    static func appStore(bundleId: String, name: String, current: String, build: String?, installedAt: Date?,
                          country: String, allowBeta: Bool) async -> Outcome? {
         // 加时间戳：Apple CDN 会把 iTunes lookup 结果缓存 24h，
         // 我们虽然已经关了 URLSession 缓存，但 Akamai 中间层可能还是按 URL 缓存，
@@ -870,18 +870,36 @@ enum Checker {
               let count = obj["resultCount"] as? Int, count > 0,
               let results = obj["results"] as? [[String: Any]],
               let first = results.first,
-              let latest = first["version"] as? String else { return nil }
-        let page = first["trackViewUrl"] as? String
+              let firstVersion = first["version"] as? String else { return nil }
+        var latest = firstVersion
+        var page = first["trackViewUrl"] as? String
         // sellerUrl 是开发者自己的官网（Compressor → apple.com/mac/compressor …），
         // 比商店产品页更像「软件网站」
         let seller = (first["sellerUrl"] as? String).flatMap { URL(string: $0)?.absoluteString }
-        let release = parseISO8601(first["currentVersionReleaseDate"] as? String)
+        var release = parseISO8601(first["currentVersionReleaseDate"] as? String)
 
         // kind=software 说明这条记录是 iOS 主记录（APTV 这种全平台通用 App）：
         // version/更新说明都是 iPhone 版的，接口根本不提供 Mac 版的版本号
         //（Mac App Store 应用里显示的才是 Mac 版，二者经常差一个小版本）。
+        // 例外：features 带 iosUniversal 的是「一份通用 App」—— iOS / iPad / Mac
+        // 共用同一个版本号（APTV、Notability、Keynote 都是），这时记录的版本号
+        // 就是 Mac 版的版本号，可以照常比。
+        let features = (first["features"] as? [String]) ?? []
+        let isUniversalApp = features.contains("iosUniversal")
+        var isIOSPrimaryRecord = (first["kind"] as? String) != "mac-software" && !isUniversalApp
+
+        // Apple 自家 App（Pages / Numbers / Keynote、Final Cut、Logic 这些 Creator Studio）
+        // 的 bundleId 跟 iOS 版是同一个，lookup 只会给 iOS 主记录 —— Final Cut 甚至返回 3.x。
+        // 它们的 Mac 版在商店里是独立记录，按名字搜 macSoftware 就能拿到真正的 Mac 版本。
+        if isIOSPrimaryRecord, bundleId.hasPrefix("com.apple."),
+           let mac = await appleMacStoreRecord(name: name, country: country) {
+            latest = mac.version
+            page = mac.page ?? page
+            release = mac.release ?? release
+            isIOSPrimaryRecord = false
+        }
+
         // 它要是说「比本机新」，不能当 Mac 版更新的证据——宁可说「核对不了」，别误报。
-        let isIOSPrimaryRecord = (first["kind"] as? String) != "mac-software"
         if isIOSPrimaryRecord, Ver.isNewer(latest, than: current) {
             return Outcome(status: .unknown, latest: nil, url: page, homepage: seller,
                            note: "商店接口只提供它 iOS 版的版本号（\(latest)），Mac 版请对照 App Store 应用内的页面")
@@ -921,6 +939,36 @@ enum Checker {
                            : nil,
                        releaseDate: release,
                        notes: plainNotes(first["releaseNotes"] as? String))
+    }
+
+    /// Apple 自家 App 的 Mac 版记录。
+    /// Pages / Numbers / Keynote / Final Cut / Logic 这些「Creator Studio」App 的 bundleId
+    /// 跟 iOS 版共用，`lookup?bundleId=` 只会返回 iOS 主记录（Final Cut 甚至只有 3.x）。
+    /// Mac 版在商店里是独立记录，`search?entity=macSoftware` 按名字能搜到；
+    /// 这里挑「名字对得上、卖家是 Apple、版本号最高」的那条。
+    private static func appleMacStoreRecord(name: String,
+                                            country: String) async -> (version: String, page: String?, release: Date?)? {
+        let term = name.replacingOccurrences(of: " Creator Studio", with: "")
+        guard !term.isEmpty,
+              let encoded = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed),
+              let obj = await Net.json("https://itunes.apple.com/search?term=\(encoded)&country=\(country)&entity=macSoftware&limit=25&_=\(Int(Date().timeIntervalSince1970))") as? [String: Any],
+              let results = obj["results"] as? [[String: Any]] else { return nil }
+        let lowered = term.lowercased()
+        let hits = results.filter { r in
+            guard let seller = r["sellerName"] as? String, seller.contains("Apple"),
+                  let title = r["trackName"] as? String else { return false }
+            return title.lowercased().hasPrefix(lowered)
+        }
+        guard var best = hits.first, var bestVersion = best["version"] as? String else { return nil }
+        for r in hits.dropFirst() {
+            guard let v = r["version"] as? String else { continue }
+            if Ver.isNewer(v, than: bestVersion) {
+                best = r
+                bestVersion = v
+            }
+        }
+        return (bestVersion, best["trackViewUrl"] as? String,
+                parseISO8601(best["currentVersionReleaseDate"] as? String))
     }
 }
 
